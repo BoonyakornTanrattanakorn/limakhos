@@ -19,3 +19,8 @@ serde_json = { workspace = true }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 futures-util = "0.3"
+
+[dev-dependencies]
+http-body-util = "0.1"
+tokio-tungstenite = "0.24"
+tower = { version = "0.5", features = ["util"] }
