@@ -1136,7 +1136,7 @@ fn negamax(
                 && ev >= beta
                 && beta.abs() < MATE_THRESHOLD
             {
-                let r = 3 + depth / 4 + ((ev - beta) / 160).clamp(0, 3) as u8;
+                let r = 3 + depth / 3 + ((ev - beta) / 160).clamp(0, 3) as u8;
                 let null_depth = depth.saturating_sub(1 + r);
                 let null_pos = apply_null_move(pos);
                 ctx.move_piece_to[ply_idx] = NO_PIECE_TO;
@@ -1415,7 +1415,7 @@ fn negamax(
 
     // Forced single-capture extension
     let is_forced_capture = rem_count == 1 && is_capture_node;
-    let base_next_depth = if is_forced_capture && ply < 24 {
+    let base_next_depth = if is_forced_capture && (ply < 20 || (is_pv && ply < 28)) {
         depth
     } else {
         depth - 1
