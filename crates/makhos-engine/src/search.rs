@@ -205,7 +205,7 @@ impl Default for Engine {
 impl Engine {
     pub fn new() -> Self {
         Self {
-            tt: TranspositionTable::new(1 << 18), // 262,144 entries (65,536 × 4-way cache-line buckets = 4 MB)
+            tt: TranspositionTable::new(1 << 19), // 655,360 entries (131,072 × 5-way 64-byte cache-line buckets = 8 MB)
             history: [[[0; 33]; 33]; 2],
             cont1_hist: zero_cont_table(),
             cont2_hist: zero_cont_table(),

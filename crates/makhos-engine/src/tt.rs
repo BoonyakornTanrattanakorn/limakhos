@@ -23,11 +23,13 @@ impl Bound {
     }
 }
 
-/// Compact 16-byte TT entry (4 entries fit cleanly in one 64-byte CPU cache line).
+/// Compact 12-byte TT entry (5 entries fit in one 64-byte CPU cache line).
+/// Bucket index verifies the low 16-18 bits of `key`, and `key_hi` verifies the upper 32 bits
+/// (48-50 bits total key verification).
 #[derive(Copy, Clone, Debug)]
 #[repr(C)]
 struct RawTtEntry {
-    key: u64,
+    key_hi: u32,
     score: i16,
     static_eval: i16,
     depth: u8,
@@ -40,7 +42,7 @@ struct RawTtEntry {
 impl Default for RawTtEntry {
     fn default() -> Self {
         Self {
-            key: 0,
+            key_hi: 0,
             score: 0,
             static_eval: EVAL_NONE,
             depth: 0,
@@ -81,12 +83,15 @@ pub struct TtEntry {
     pub best_to: u8,
 }
 
-/// 4-way set-associative cache-line bucket (64 bytes aligned = 1 cache line per probe).
+/// 5-way set-associative cache-line bucket (64 bytes aligned = 1 cache line per probe).
 #[derive(Copy, Clone, Default, Debug)]
 #[repr(C, align(64))]
 struct TtBucket {
-    slots: [RawTtEntry; 4],
+    slots: [RawTtEntry; 5],
 }
+
+const _: () =
+    assert!(std::mem::size_of::<RawTtEntry>() == 12 && std::mem::size_of::<TtBucket>() == 64);
 
 pub struct TranspositionTable {
     buckets: Vec<TtBucket>,
@@ -95,8 +100,8 @@ pub struct TranspositionTable {
 }
 
 impl TranspositionTable {
-    /// Allocate a power-of-two transposition table organized as 4-way 64-byte cache-line buckets.
-    /// Default `1 << 18` = 262,144 entries (65,536 buckets × 64 bytes = 4 MB).
+    /// Allocate a power-of-two transposition table organized as 5-way 64-byte cache-line buckets.
+    /// `power_of_two_entries` sets `bucket_count = total / 4` (e.g. `1 << 18` -> 65,536 buckets = 4 MB, 327,680 entries).
     pub fn new(power_of_two_entries: usize) -> Self {
         let total = power_of_two_entries.next_power_of_two().max(4096);
         let bucket_count = (total / 4).max(1024);
@@ -136,11 +141,16 @@ impl TranspositionTable {
 
     #[inline]
     pub fn probe(&self, key: u64) -> Option<TtEntry> {
-        let bucket = &self.buckets[(key as usize) & self.mask];
-        for slot in bucket.slots {
-            if slot.meta != 0 && slot.key == key {
+        let key_hi = (key >> 32) as u32;
+        // SAFETY: `self.buckets.len()` is a power of two and `self.mask == self.buckets.len() - 1`.
+        let bucket = unsafe { self.buckets.get_unchecked((key as usize) & self.mask) };
+        for slot in &bucket.slots {
+            if slot.meta == 0 {
+                return None;
+            }
+            if slot.key_hi == key_hi {
                 return Some(TtEntry {
-                    key: slot.key,
+                    key,
                     score: slot.score as i32,
                     static_eval: if slot.static_eval == EVAL_NONE {
                         None
@@ -173,6 +183,7 @@ impl TranspositionTable {
         best_to: u8,
     ) {
         let idx = (key as usize) & self.mask;
+        let key_hi = (key >> 32) as u32;
         let gen = self.generation;
         let stored_score = score_to_tt(score, ply).clamp(-32_000, 32_000) as i16;
         let stored_eval = match static_eval {
@@ -181,17 +192,18 @@ impl TranspositionTable {
         };
         let meta = (gen << 3) | (u8::from(tt_pv) << 2) | (bound as u8);
 
-        let bucket = &mut self.buckets[idx];
+        // SAFETY: `self.buckets.len()` is a power of two and `self.mask == self.buckets.len() - 1`.
+        let bucket = unsafe { self.buckets.get_unchecked_mut(idx) };
         let mut replace_idx = 0usize;
         let mut worst_priority = i32::MAX;
 
-        for i in 0..4 {
+        for i in 0..5 {
             let slot = bucket.slots[i];
             if slot.meta == 0 {
                 replace_idx = i;
                 break;
             }
-            if slot.key == key {
+            if slot.key_hi == key_hi {
                 let merged_tt_pv = slot.tt_pv() || tt_pv;
                 // Same position: always update if exact, deeper, or stale generation; preserve best move if none
                 if depth >= slot.depth || bound == Bound::Exact || slot.generation() != gen {
@@ -204,7 +216,7 @@ impl TranspositionTable {
                     };
                     let updated_meta = (gen << 3) | (u8::from(merged_tt_pv) << 2) | (bound as u8);
                     bucket.slots[i] = RawTtEntry {
-                        key,
+                        key_hi,
                         score: stored_score,
                         static_eval: final_eval,
                         depth,
@@ -212,8 +224,17 @@ impl TranspositionTable {
                         best_from: final_from,
                         best_to: final_to,
                     };
-                } else if merged_tt_pv && !slot.tt_pv() {
-                    bucket.slots[i].meta |= 0x04;
+                } else {
+                    if merged_tt_pv && !slot.tt_pv() {
+                        bucket.slots[i].meta |= 0x04;
+                    }
+                    if slot.static_eval == EVAL_NONE && stored_eval != EVAL_NONE {
+                        bucket.slots[i].static_eval = stored_eval;
+                    }
+                    if slot.best_from == 0 && best_from != 0 {
+                        bucket.slots[i].best_from = best_from;
+                        bucket.slots[i].best_to = best_to;
+                    }
                 }
                 return;
             }
@@ -228,7 +249,7 @@ impl TranspositionTable {
         }
 
         bucket.slots[replace_idx] = RawTtEntry {
-            key,
+            key_hi,
             score: stored_score,
             static_eval: stored_eval,
             depth,
