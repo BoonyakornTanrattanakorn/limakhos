@@ -1,10 +1,39 @@
-use makhos_core::{Color, Position, Square, MAIN_DIAGONAL_MASK};
+use crate::eval::MANHATTAN_DIST;
+use makhos_core::{Color, Position, MAIN_DIAGONAL_MASK};
 
 /// Double-corner / main-diagonal anchor squares (`4` and `29`).
 const MAIN_CORNERS_MASK: u32 = (1 << 3) | (1 << 28);
 
 /// Corner squares where a lone King is easiest to trap in Makhos 8 (`1, 4, 29, 32`).
 const CORNER_SQUARES_MASK: u32 = (1 << 0) | (1 << 3) | (1 << 28) | (1 << 31);
+
+const LIGHT_AHEAD_MASK: [u32; 8] = {
+    let mut t = [0u32; 8];
+    let mut row = 0usize;
+    while row < 8 {
+        t[row] = if row < 6 {
+            !0u32 << ((row + 1) * 4)
+        } else {
+            0xF000_0000u32
+        };
+        row += 1;
+    }
+    t
+};
+
+const DARK_AHEAD_MASK: [u32; 8] = {
+    let mut t = [0u32; 8];
+    let mut row = 0usize;
+    while row < 8 {
+        t[row] = if row > 0 {
+            (1u32 << (row * 4)) - 1
+        } else {
+            0x0000_000Fu32
+        };
+        row += 1;
+    }
+    t
+};
 
 /// Endgame-specific heuristic adjustments (from Light's perspective) for positions
 /// with `<= 6` pieces that are not yet resolved by exact tablebase lookups.
@@ -42,41 +71,34 @@ pub fn evaluate_endgame_adjustment(pos: &Position, raw_diff: i32) -> i32 {
 
     // 2. Passed / free-running Man bonus in low-piece endgames
     if pos.light_men != 0 {
+        let dark_all = pos.dark_pieces();
         let mut m = pos.light_men;
         while m != 0 {
-            let idx = m.trailing_zeros() as u8;
+            let idx = m.trailing_zeros() as usize;
             m &= m - 1;
-            let row = (idx / 4) as i32; // 0..6
-            // Check if any Dark piece sits ahead of this Man (higher row)
-            let ahead_mask = if row < 6 {
-                !0u32 << ((row + 1) * 4)
-            } else {
-                0xF000_0000u32
-            };
+            let row = idx >> 2; // 0..6
+            let ahead_mask = LIGHT_AHEAD_MASK[row];
             if (pos.dark_men & ahead_mask) == 0 && dk == 0 {
                 // Uncontested race to crown!
-                adj += 25 + row * 12;
-            } else if (pos.dark_pieces() & ahead_mask) == 0 {
-                adj += 18 + row * 8;
+                adj += 25 + (row as i32) * 12;
+            } else if (dark_all & ahead_mask) == 0 {
+                adj += 18 + (row as i32) * 8;
             }
         }
     }
 
     if pos.dark_men != 0 {
+        let light_all = pos.light_pieces();
         let mut m = pos.dark_men;
         while m != 0 {
-            let idx = m.trailing_zeros() as u8;
+            let idx = m.trailing_zeros() as usize;
             m &= m - 1;
-            let row = (idx / 4) as i32; // 1..7
-            let advance = 7 - row;
-            let ahead_mask = if row > 0 {
-                (1u32 << (row * 4)) - 1
-            } else {
-                0x0000_000Fu32
-            };
+            let row = idx >> 2; // 1..7
+            let advance = 7 - (row as i32);
+            let ahead_mask = DARK_AHEAD_MASK[row];
             if (pos.light_men & ahead_mask) == 0 && lk == 0 {
                 adj -= 25 + advance * 12;
-            } else if (pos.light_pieces() & ahead_mask) == 0 {
+            } else if (light_all & ahead_mask) == 0 {
                 adj -= 18 + advance * 8;
             }
         }
@@ -120,17 +142,15 @@ fn king_vs_lone_king_squeeze(winning_kings: u32, lone_king: u32, winner_to_move:
     }
 
     // Coordination: reward winning kings being close enough to form a barrier/net
-    let def_sq = Square::from_index(lone_king.trailing_zeros() as u8).unwrap();
-    let (dr, dc) = def_sq.to_row_col();
+    let def_idx = lone_king.trailing_zeros() as usize;
+    let dist_row = &MANHATTAN_DIST[def_idx];
     let mut wk = winning_kings;
     let mut dist_sum = 0i32;
     let mut count = 0i32;
     while wk != 0 {
-        let sq = Square::from_index(wk.trailing_zeros() as u8).unwrap();
+        let w_idx = wk.trailing_zeros() as usize;
         wk &= wk - 1;
-        let (wr, wc) = sq.to_row_col();
-        let d = (wr as i32 - dr as i32).abs() + (wc as i32 - dc as i32).abs();
-        dist_sum += d;
+        dist_sum += dist_row[w_idx] as i32;
         count += 1;
     }
     if count > 0 {

@@ -164,6 +164,33 @@ pub fn evaluate(pos: &Position) -> i32 {
     }
 }
 
+pub(crate) const CENTER_DIST: [i32; 32] = {
+    let mut t = [0i32; 32];
+    let mut i = 0usize;
+    while i < 32 {
+        let (r, c) = Square::new_unchecked((i + 1) as u8).to_row_col();
+        t[i] = (r as i32 * 2 - 7).abs() + (c as i32 * 2 - 7).abs();
+        i += 1;
+    }
+    t
+};
+
+pub(crate) const MANHATTAN_DIST: [[u8; 32]; 32] = {
+    let mut t = [[0u8; 32]; 32];
+    let mut a = 0usize;
+    while a < 32 {
+        let (ar, ac) = Square::new_unchecked((a + 1) as u8).to_row_col();
+        let mut b = 0usize;
+        while b < 32 {
+            let (br, bc) = Square::new_unchecked((b + 1) as u8).to_row_col();
+            t[a][b] = ((ar as i32 - br as i32).abs() + (ac as i32 - bc as i32).abs()) as u8;
+            b += 1;
+        }
+        a += 1;
+    }
+    t
+};
+
 fn endgame_mop_up(winning_kings: u32, losing_pieces: u32) -> i32 {
     if winning_kings == 0 || losing_pieces == 0 {
         return 0;
@@ -172,27 +199,25 @@ fn endgame_mop_up(winning_kings: u32, losing_pieces: u32) -> i32 {
 
     // Prefer pushing losing pieces away from center
     let mut lp = losing_pieces;
-    let mut l_coords = [(0i32, 0i32); 4];
+    let mut l_idxs = [0usize; 4];
     let mut l_len = 0usize;
     while lp != 0 && l_len < 4 {
-        let sq = Square::from_index(lp.trailing_zeros() as u8).unwrap();
+        let idx = lp.trailing_zeros() as usize;
         lp &= lp - 1;
-        let (r, c) = sq.to_row_col();
-        let center_dist = (r as i32 * 2 - 7).abs() + (c as i32 * 2 - 7).abs();
-        bonus += center_dist * 3;
-        l_coords[l_len] = (r as i32, c as i32);
+        bonus += CENTER_DIST[idx] * 3;
+        l_idxs[l_len] = idx;
         l_len += 1;
     }
 
     // Prefer bringing winning kings closer to losing pieces
     let mut wk = winning_kings;
     while wk != 0 {
-        let sq = Square::from_index(wk.trailing_zeros() as u8).unwrap();
+        let w_idx = wk.trailing_zeros() as usize;
         wk &= wk - 1;
-        let (wr, wc) = sq.to_row_col();
-        let mut min_dist = 16;
-        for &(lr, lc) in &l_coords[..l_len] {
-            let d = (wr as i32 - lr).abs() + (wc as i32 - lc).abs();
+        let row = &MANHATTAN_DIST[w_idx];
+        let mut min_dist = 16i32;
+        for &l_idx in &l_idxs[..l_len] {
+            let d = row[l_idx] as i32;
             if d < min_dist {
                 min_dist = d;
             }

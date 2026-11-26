@@ -376,88 +376,106 @@ pub fn generate_fast_quiet_moves(pos: &Position, out: &mut FastMoveList) {
     }
 }
 
-/// Apply a `FastMove` with pure bitboard ops and incremental Zobrist hashing (zero heap allocations).
-#[inline]
-pub fn apply_fast_move(pos: &Position, mv: FastMove) -> Position {
+#[inline(always)]
+fn apply_fast_move_side<const IS_LIGHT: bool>(pos: &Position, mv: FastMove) -> Position {
     let mut next = *pos;
-    let us = pos.side_to_move;
-    let them = us.opponent();
+    let us = if IS_LIGHT { Color::Light } else { Color::Dark };
+    let them = if IS_LIGHT { Color::Dark } else { Color::Light };
     let from_idx = (mv.from - 1) as usize;
     let to_idx = (mv.to - 1) as usize;
     let from_bit = 1u32 << from_idx;
     let to_bit = 1u32 << to_idx;
 
-    let is_man_move = (pos.men_of(us) & from_bit) != 0;
-    let start_kind = if is_man_move {
-        PieceKind::Man
-    } else {
-        PieceKind::King
-    };
-    let end_kind = if mv.promotes {
-        PieceKind::King
-    } else {
-        start_kind
-    };
-
-    // Remove mover from origin
-    next.hash ^= zobrist::piece_key_idx(us, start_kind, from_idx);
-    match (us, start_kind) {
-        (Color::Light, PieceKind::Man) => next.light_men &= !from_bit,
-        (Color::Dark, PieceKind::Man) => next.dark_men &= !from_bit,
-        (Color::Light, PieceKind::King) => next.light_kings &= !from_bit,
-        (Color::Dark, PieceKind::King) => next.dark_kings &= !from_bit,
-    }
-
-    // Remove all captured opponent pieces via bitmask
-    if mv.cap_mask != 0 {
-        let cap_men = next.men_of(them) & mv.cap_mask;
-        let cap_kings = next.kings_of(them) & mv.cap_mask;
-        match them {
-            Color::Light => {
-                next.light_men &= !cap_men;
-                next.light_kings &= !cap_kings;
-            }
-            Color::Dark => {
-                next.dark_men &= !cap_men;
-                next.dark_kings &= !cap_kings;
-            }
-        }
-        let mut cm = cap_men;
-        while cm != 0 {
-            let idx = cm.trailing_zeros() as usize;
-            cm &= cm - 1;
-            next.hash ^= zobrist::piece_key_idx(them, PieceKind::Man, idx);
-        }
-        let mut ck = cap_kings;
-        while ck != 0 {
-            let idx = ck.trailing_zeros() as usize;
-            ck &= ck - 1;
-            next.hash ^= zobrist::piece_key_idx(them, PieceKind::King, idx);
-        }
-    }
-
-    // Place mover on destination
-    match (us, end_kind) {
-        (Color::Light, PieceKind::Man) => next.light_men |= to_bit,
-        (Color::Dark, PieceKind::Man) => next.dark_men |= to_bit,
-        (Color::Light, PieceKind::King) => next.light_kings |= to_bit,
-        (Color::Dark, PieceKind::King) => next.dark_kings |= to_bit,
-    }
-    next.hash ^= zobrist::piece_key_idx(us, end_kind, to_idx);
-
-    if is_man_move || mv.cap_mask != 0 {
-        next.king_only_plies = 0;
-    } else {
-        next.king_only_plies = next.king_only_plies.saturating_add(1);
-    }
-
     next.side_to_move = them;
     next.hash ^= zobrist::SIDE_TO_MOVE_DARK_KEY;
-    if us == Color::Dark {
+    if !IS_LIGHT {
         next.fullmove_number += 1;
     }
 
+    let (our_men, our_kings, opp_men, opp_kings) = if IS_LIGHT {
+        (
+            &mut next.light_men,
+            &mut next.light_kings,
+            &mut next.dark_men,
+            &mut next.dark_kings,
+        )
+    } else {
+        (
+            &mut next.dark_men,
+            &mut next.dark_kings,
+            &mut next.light_men,
+            &mut next.light_kings,
+        )
+    };
+
+    let is_man_move = (*our_men & from_bit) != 0;
+
+    if mv.cap_mask == 0 {
+        if is_man_move {
+            next.king_only_plies = 0;
+            if !mv.promotes {
+                *our_men ^= from_bit | to_bit;
+                next.hash ^= zobrist::piece_key_idx(us, PieceKind::Man, from_idx)
+                    ^ zobrist::piece_key_idx(us, PieceKind::Man, to_idx);
+            } else {
+                *our_men &= !from_bit;
+                *our_kings |= to_bit;
+                next.hash ^= zobrist::piece_key_idx(us, PieceKind::Man, from_idx)
+                    ^ zobrist::piece_key_idx(us, PieceKind::King, to_idx);
+            }
+        } else {
+            *our_kings ^= from_bit | to_bit;
+            next.hash ^= zobrist::piece_key_idx(us, PieceKind::King, from_idx)
+                ^ zobrist::piece_key_idx(us, PieceKind::King, to_idx);
+            next.king_only_plies = next.king_only_plies.saturating_add(1);
+        }
+        return next;
+    }
+
+    // Capture move
+    next.king_only_plies = 0;
+    if is_man_move {
+        if !mv.promotes {
+            *our_men ^= from_bit | to_bit;
+            next.hash ^= zobrist::piece_key_idx(us, PieceKind::Man, from_idx)
+                ^ zobrist::piece_key_idx(us, PieceKind::Man, to_idx);
+        } else {
+            *our_men &= !from_bit;
+            *our_kings |= to_bit;
+            next.hash ^= zobrist::piece_key_idx(us, PieceKind::Man, from_idx)
+                ^ zobrist::piece_key_idx(us, PieceKind::King, to_idx);
+        }
+    } else {
+        *our_kings ^= from_bit | to_bit;
+        next.hash ^= zobrist::piece_key_idx(us, PieceKind::King, from_idx)
+            ^ zobrist::piece_key_idx(us, PieceKind::King, to_idx);
+    }
+
+    let mut cm = *opp_men & mv.cap_mask;
+    let mut ck = *opp_kings & mv.cap_mask;
+    *opp_men &= !cm;
+    *opp_kings &= !ck;
+    while cm != 0 {
+        let idx = cm.trailing_zeros() as usize;
+        cm &= cm - 1;
+        next.hash ^= zobrist::piece_key_idx(them, PieceKind::Man, idx);
+    }
+    while ck != 0 {
+        let idx = ck.trailing_zeros() as usize;
+        ck &= ck - 1;
+        next.hash ^= zobrist::piece_key_idx(them, PieceKind::King, idx);
+    }
+
     next
+}
+
+/// Apply a `FastMove` with pure bitboard ops and incremental Zobrist hashing (zero heap allocations).
+#[inline]
+pub fn apply_fast_move(pos: &Position, mv: FastMove) -> Position {
+    match pos.side_to_move {
+        Color::Light => apply_fast_move_side::<true>(pos, mv),
+        Color::Dark => apply_fast_move_side::<false>(pos, mv),
+    }
 }
 
 /// Pass the turn without moving any piece (used for Null Move Pruning in alpha-beta search).
