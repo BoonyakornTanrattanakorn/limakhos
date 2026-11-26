@@ -374,7 +374,7 @@ impl Engine {
         let mut completed_depth = 0u8;
         let mut best_lines: Vec<AnalysisLine> = Vec::new();
         let mut prev_pv_order: Vec<(u8, u8)> = Vec::new();
-        let mut prev_best_score: Option<i32> = None;
+        let mut prev_pv_scores: Vec<i32> = Vec::new();
 
         for depth in 1..=max_depth {
             if depth > 1 && ctx.check_abort() {
@@ -384,7 +384,7 @@ impl Engine {
             let mut iter_lines: Vec<AnalysisLine> = Vec::with_capacity(target_pv_count);
 
             for pv_idx in 0..target_pv_count {
-                let hint_score = if pv_idx == 0 { prev_best_score } else { None };
+                let hint_score = prev_pv_scores.get(pv_idx).copied();
                 let Some((score, mv)) = search_root_aspiration(
                     &mut ctx,
                     pos,
@@ -430,7 +430,7 @@ impl Engine {
                         .iter()
                         .map(|l| (l.best_move.from.number(), l.best_move.to.number()))
                         .collect();
-                    prev_best_score = iter_lines.first().map(|l| l.score_cp);
+                    prev_pv_scores = iter_lines.iter().map(|l| l.score_cp).collect();
                     best_lines = iter_lines;
                     completed_depth = depth;
                     ctx.completed_depth = completed_depth;
@@ -693,11 +693,11 @@ impl<'a, 'p> SearchContext<'a, 'p> {
     }
 }
 
-/// Mix `king_only_plies` into the TT key once approaching the 32-ply draw horizon (`>= 12`)
+/// Mix `king_only_plies` into the TT key once approaching the 32-ply draw horizon (`>= 22`)
 /// so TT entries remain 100% exact without disabling TT caching or move ordering!
 #[inline]
 fn tt_key_for_pos(pos: &Position) -> u64 {
-    if pos.king_only_plies >= 12 {
+    if pos.king_only_plies >= 22 {
         pos.hash ^ ((pos.king_only_plies as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15))
     } else {
         pos.hash
@@ -722,7 +722,7 @@ fn search_root_aspiration(
     prev_pv_order: &[(u8, u8)],
     prev_score: Option<i32>,
 ) -> Option<(i32, Move)> {
-    if depth >= 4 && excluded.is_empty() {
+    if depth >= 4 {
         if let Some(prev) = prev_score {
             if prev.abs() < MATE_THRESHOLD - 500 {
                 let mut delta = 14i32;
