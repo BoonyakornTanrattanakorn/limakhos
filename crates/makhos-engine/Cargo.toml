@@ -1,0 +1,10 @@
+[package]
+name = "makhos-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "32-bit bitboard alpha-beta AI and Multi-PV analysis engine for Thai Draughts (Makhos 8)"
+
+[dependencies]
+makhos-core = { path = "../makhos-core" }
+serde = { workspace = true }
