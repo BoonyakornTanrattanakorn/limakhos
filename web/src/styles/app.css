@@ -661,3 +661,105 @@ textarea {
   color: var(--emerald);
   min-height: 1.1em;
 }
+
+.online-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.online-alert {
+  padding: 9px 12px;
+  border-radius: 8px;
+  border: 1px solid rgba(239, 68, 68, 0.5);
+  background: rgba(239, 68, 68, 0.12);
+  color: #fecaca;
+  font-size: 0.83rem;
+}
+
+.inline-row {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.inline-row input,
+.inline-row select {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 5px 8px;
+  color: var(--text);
+  font-size: 0.84rem;
+}
+
+.inline-row input {
+  flex: 1;
+  min-width: 110px;
+}
+
+.room-list,
+.compact-table {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: 185px;
+  overflow-y: auto;
+}
+
+.room-row,
+.table-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 6px 8px;
+  border-radius: 6px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  font-size: 0.82rem;
+}
+
+.room-meta {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.room-players {
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.room-sub {
+  color: var(--muted);
+  font-size: 0.75rem;
+}
+
+.invite-bar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 8px;
+  border-radius: 6px;
+  background: var(--bg);
+  border: 1px dashed var(--accent);
+  font-family: ui-monospace, monospace;
+  font-size: 0.78rem;
+}
+
+.invite-bar code {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.badge-muted {
+  color: var(--muted);
+  font-size: 0.76rem;
+}

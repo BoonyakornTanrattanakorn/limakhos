@@ -6,6 +6,7 @@ export interface Messages {
   modeAnalysis: string;
   modeAi: string;
   modeLocal: string;
+  modeOnline: string;
   lightSide: string;
   darkSide: string;
   aiLevel: string;
@@ -47,15 +48,45 @@ export interface Messages {
   drawLabel: string;
   playAs: string;
   noMovesYet: string;
+  onlineAccount: string;
+  guestName: string;
+  username: string;
+  password: string;
+  login: string;
+  register: string;
+  logout: string;
+  onlineLobby: string;
+  quickMatch: string;
+  createPrivate: string;
+  joinById: string;
+  roomIdPlaceholder: string;
+  joinRoom: string;
+  watchRoom: string;
+  leaveRoom: string;
+  copyInvite: string;
+  openRooms: string;
+  noOpenRooms: string;
+  refresh: string;
+  leaderboard: string;
+  recentGames: string;
+  noGamesYet: string;
+  analyzeGame: string;
+  waitingOpponent: string;
+  spectating: string;
+  spectators: string;
+  onlineOfflineError: string;
+  disconnected: string;
+  ratingLabel: string;
 }
 
 export const MESSAGES: Record<Locale, Messages> = {
   en: {
     appTitle: "Limakhos",
-    subtitle: "Makhos 8 (TCA 2025) • Local WASM Engine",
+    subtitle: "Makhos 8 (TCA 2025) • Local WASM & Self-Hosted Play",
     modeAnalysis: "Analysis",
     modeAi: "Play vs AI",
     modeLocal: "Local 2P",
+    modeOnline: "Online",
     lightSide: "Light (1–8, First)",
     darkSide: "Dark (25–32)",
     aiLevel: "AI Level",
@@ -97,13 +128,43 @@ export const MESSAGES: Record<Locale, Messages> = {
     drawLabel: "Draw",
     playAs: "Play as",
     noMovesYet: "No moves yet — Light moves first.",
+    onlineAccount: "Account / Guest",
+    guestName: "Guest Name",
+    username: "Username",
+    password: "Password",
+    login: "Sign In",
+    register: "Register",
+    logout: "Sign Out",
+    onlineLobby: "Multiplayer Lobby",
+    quickMatch: "Quick Matchmaking",
+    createPrivate: "Create Private Room",
+    joinById: "Join / Watch by Room ID",
+    roomIdPlaceholder: "Room ID (e.g. a1b2c3d4)",
+    joinRoom: "Join",
+    watchRoom: "Watch",
+    leaveRoom: "Leave Room",
+    copyInvite: "Copy Invite Link",
+    openRooms: "Open Rooms",
+    noOpenRooms: "No open rooms yet — create one or queue a match!",
+    refresh: "Refresh",
+    leaderboard: "Glicko-2 Leaderboard",
+    recentGames: "Recent Games",
+    noGamesYet: "No archived games yet.",
+    analyzeGame: "Analyze",
+    waitingOpponent: "Waiting for opponent...",
+    spectating: "Spectating",
+    spectators: "Spectators",
+    onlineOfflineError: "Online server unreachable. Local Analysis, AI, and 2P modes continue working 100% offline.",
+    disconnected: "offline",
+    ratingLabel: "Rating",
   },
   th: {
     appTitle: "Limakhos",
-    subtitle: "หมากฮอส 8 ตัว (กติกา พ.ศ. 2568) • วิเคราะห์ในเบราว์เซอร์",
+    subtitle: "หมากฮอส 8 ตัว (กติกา พ.ศ. 2568) • วิเคราะห์ในเบราว์เซอร์ & ออนไลน์",
     modeAnalysis: "กระดานวิเคราะห์",
     modeAi: "เล่นกับบอท AI",
     modeLocal: "เล่น 2 คน",
+    modeOnline: "เล่นออนไลน์",
     lightSide: "ฝ่ายสีอ่อน (1–8, เดินก่อน)",
     darkSide: "ฝ่ายสีเข้ม (25–32)",
     aiLevel: "ระดับ AI",
@@ -145,5 +206,34 @@ export const MESSAGES: Record<Locale, Messages> = {
     drawLabel: "เสมอ",
     playAs: "เลือกฝ่าย",
     noMovesYet: "ยังไม่มีตาเดิน — ฝ่ายสีอ่อนเดินก่อน",
+    onlineAccount: "บัญชีผู้เล่น / ผู้เยี่ยมชม",
+    guestName: "ชื่อผู้เล่น (Guest)",
+    username: "ชื่อผู้ใช้",
+    password: "รหัสผ่าน",
+    login: "เข้าสู่ระบบ",
+    register: "สมัครสมาชิก",
+    logout: "ออกจากระบบ",
+    onlineLobby: "ห้องเล่นออนไลน์",
+    quickMatch: "จับคู่ด่วน (Matchmaking)",
+    createPrivate: "สร้างห้องส่วนตัว",
+    joinById: "เข้าห้องด้วยรหัสห้อง",
+    roomIdPlaceholder: "รหัสห้อง (เช่น a1b2c3d4)",
+    joinRoom: "เข้าร่วม",
+    watchRoom: "เข้าชม",
+    leaveRoom: "ออกจากห้อง",
+    copyInvite: "คัดลอกลิงก์ชวนเพื่อน",
+    openRooms: "ห้องที่เปิดอยู่",
+    noOpenRooms: "ยังไม่มีห้องเปิด — กดสร้างห้องหรือจับคู่ด่วนได้เลย",
+    refresh: "รีเฟรช",
+    leaderboard: "อันดับคะแนน Glicko-2",
+    recentGames: "กระดานล่าสุด",
+    noGamesYet: "ยังไม่มีประวัติการแข่งขัน",
+    analyzeGame: "วิเคราะห์",
+    waitingOpponent: "กำลังรอผู้เล่นอีกฝ่าย...",
+    spectating: "กำลังรับชม",
+    spectators: "ผู้ชม",
+    onlineOfflineError: "ไม่สามารถเชื่อมต่อเซิร์ฟเวอร์ออนไลน์ได้ (โหมดวิเคราะห์, AI และเล่น 2 คนยังใช้งานแบบออฟไลน์ได้ตามปกติ)",
+    disconnected: "หลุดการเชื่อมต่อ",
+    ratingLabel: "เรตติ้ง",
   },
 };
