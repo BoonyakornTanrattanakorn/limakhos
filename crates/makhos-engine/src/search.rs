@@ -1102,7 +1102,7 @@ fn negamax(
     if !is_pv && !has_cap && !near_draw_horizon && piece_count >= 4 {
         if let Some(ev) = refined_eval {
             // 1. Reverse Futility Pruning (Static Null Move Pruning)
-            if depth <= 7
+            if depth <= 9
                 && beta.abs() < MATE_THRESHOLD
                 && (piece_count >= 6 || has_own_king)
             {
