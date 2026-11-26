@@ -4,6 +4,7 @@ members = [
     "crates/makhos-core",
     "crates/makhos-engine",
     "crates/makhos-wasm",
+    "crates/makhos-server",
 ]
 
 [workspace.package]
