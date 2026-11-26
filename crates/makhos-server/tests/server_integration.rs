@@ -350,3 +350,34 @@ async fn authoritative_server_clock_flags_timeout() {
     }
     assert!(timed_out, "expected server sweeper to flag timeout");
 }
+
+#[tokio::test]
+async fn tablebase_endpoint_handles_unavailable_and_loaded_slices() {
+    // 1. Without loaded tablebases -> available: false
+    let db = Database::open_in_memory().unwrap();
+    let app_empty = build_router(AppState::new(db), None);
+
+    let (status, resp) = http_json(&app_empty, "GET", "/api/tablebase?fen=W:WK4:BK8", None, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(resp["available"], false);
+    assert!(resp["wdl"].is_null());
+    assert!(resp["dtz"].is_null());
+    assert_eq!(resp["best_moves"], json!([]));
+
+    // Invalid FEN returns 400
+    let (status, _) = http_json(&app_empty, "GET", "/api/tablebase?fen=BAD_FEN", None, None).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // 2. With 2-piece tablebases loaded -> available: true with exact WDL/DTZ/best_moves
+    let db2 = Database::open_in_memory().unwrap();
+    let tb = makhos_tb::TablebaseSet::generate_up_to(2);
+    let app_tb = build_router(AppState::with_tablebases(db2, tb), None);
+
+    let (status, resp_win) = http_json(&app_tb, "GET", "/api/tablebase?fen=W:WK4:BK8", None, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(resp_win["available"], true);
+    assert_eq!(resp_win["wdl"], "win");
+    assert_eq!(resp_win["dtz"], 1);
+    assert_eq!(resp_win["best_moves"][0]["notation"], "4x11");
+    assert_eq!(resp_win["best_moves"][0]["wdl"], "win");
+}

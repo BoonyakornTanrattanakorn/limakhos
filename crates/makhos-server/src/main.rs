@@ -1,7 +1,8 @@
 //! Limakhos self-hosted multiplayer server binary.
 
 use makhos_server::{build_router, db::Database, AppState};
-use std::path::PathBuf;
+use makhos_tb::TablebaseSet;
+use std::path::{Path, PathBuf};
 use tokio::net::TcpListener;
 use tracing_subscriber::EnvFilter;
 
@@ -15,9 +16,29 @@ async fn main() {
     let db_path = std::env::var("LIMAKHOS_DB").unwrap_or_else(|_| "data/limakhos.db".to_string());
     let static_dir =
         std::env::var("LIMAKHOS_STATIC_DIR").unwrap_or_else(|_| "web/dist".to_string());
+    let tb_dir =
+        std::env::var("LIMAKHOS_TB_DIR").unwrap_or_else(|_| "data/tablebases".to_string());
 
     let db = Database::open_file(&db_path).expect("failed to initialize SQLite database");
-    let state = AppState::new(db);
+    let tb = match TablebaseSet::load_dir(Path::new(&tb_dir)) {
+        Ok(set) => {
+            if !set.is_empty() {
+                tracing::info!(
+                    tb_dir = %tb_dir,
+                    slices = set.slice_count(),
+                    max_pieces = set.max_pieces(),
+                    "Loaded offline endgame tablebases"
+                );
+            }
+            set
+        }
+        Err(err) => {
+            tracing::warn!(tb_dir = %tb_dir, error = %err, "Failed to load tablebases; continuing without them");
+            TablebaseSet::new()
+        }
+    };
+
+    let state = AppState::with_tablebases(db, tb);
     let app = build_router(state, Some(PathBuf::from(&static_dir)));
 
     let listener = TcpListener::bind(&bind_addr)

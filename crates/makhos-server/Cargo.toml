@@ -7,6 +7,7 @@ description = "Self-hosted multiplayer server, matchmaking, SQLite WAL archive, 
 
 [dependencies]
 makhos-core = { path = "../makhos-core" }
+makhos-tb = { path = "../makhos-tb" }
 axum = { version = "0.7", features = ["ws"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "signal"] }
 tower-http = { version = "0.5", features = ["cors", "fs", "trace"] }

@@ -16,9 +16,11 @@ use axum::{
     Json, Router,
 };
 use futures_util::{SinkExt, StreamExt};
-use makhos_core::Color;
+use makhos_core::{from_fen, Color};
+use makhos_tb::{TablebaseSet, TbMoveEval, Wdl};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use std::sync::Arc;
 use tower_http::{
     cors::{Any, CorsLayer},
     services::{ServeDir, ServeFile},
@@ -30,12 +32,21 @@ const SESSION_TTL_SECS: i64 = 30 * 24 * 60 * 60;
 pub struct AppState {
     pub db: Database,
     pub hub: Hub,
+    pub tb: Arc<TablebaseSet>,
 }
 
 impl AppState {
     pub fn new(db: Database) -> Self {
+        Self::with_tablebases(db, TablebaseSet::new())
+    }
+
+    pub fn with_tablebases(db: Database, tb: TablebaseSet) -> Self {
         let hub = Hub::new(db.clone());
-        Self { db, hub }
+        Self {
+            db,
+            hub,
+            tb: Arc::new(tb),
+        }
     }
 }
 
@@ -54,6 +65,7 @@ pub fn build_router(state: AppState, static_dir: Option<PathBuf>) -> Router {
         .route("/api/games", get(list_games))
         .route("/api/games/:id/pdn", get(get_game_pdn))
         .route("/api/rooms", post(create_room).get(list_rooms))
+        .route("/api/tablebase", get(probe_tablebase))
         .route("/ws/room/:id", get(ws_room))
         .with_state(state)
         .layer(cors);
@@ -107,6 +119,40 @@ async fn health() -> Json<HealthResponse> {
         status: "ok",
         version: env!("CARGO_PKG_VERSION"),
     })
+}
+
+#[derive(Deserialize)]
+struct TablebaseQuery {
+    fen: String,
+}
+
+#[derive(Serialize)]
+struct TablebaseResponse {
+    available: bool,
+    wdl: Option<Wdl>,
+    dtz: Option<u8>,
+    best_moves: Vec<TbMoveEval>,
+}
+
+async fn probe_tablebase(
+    State(state): State<AppState>,
+    Query(q): Query<TablebaseQuery>,
+) -> Result<Json<TablebaseResponse>, (StatusCode, Json<ErrorBody>)> {
+    let pos = from_fen(&q.fen).map_err(|e| api_err(StatusCode::BAD_REQUEST, e))?;
+    match state.tb.probe_details(&pos) {
+        Some(details) => Ok(Json(TablebaseResponse {
+            available: true,
+            wdl: Some(details.wdl),
+            dtz: Some(details.dtz),
+            best_moves: details.best_moves,
+        })),
+        None => Ok(Json(TablebaseResponse {
+            available: false,
+            wdl: None,
+            dtz: None,
+            best_moves: Vec::new(),
+        })),
+    }
 }
 
 #[derive(Deserialize)]
