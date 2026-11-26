@@ -7,7 +7,8 @@ A fast, rule-accurate **Thai Draughts (Makhos 8 — Thailand Chess Association B
 ## Features
 
 - **TCA 2025 Makhos 8 Rules**: 1–32 numbering, main diagonal (4–29), mandatory captures without majority rule, immediate removal, flying King halt-capture, promotion stops turn, automatic threefold repetition (Art. 13), automatic 16-move King-only draw (Art. 14/16), no mutual draw offers (Art. 15), and strict timeout loss (Art. 21).
-- **100% Offline Browser Mode**: Local Analysis (Multi-PV + eval bar + SVG arrows), Play vs AI (Levels 1–8), Local 2P pass-and-play, and FEN/PDN import & export via `makhos-wasm` Web Worker.
+- **100% Offline Browser Mode**: Local Analysis (Multi-PV + eval bar + SVG arrows), canonical Thai Opening Explorer (*เปิดหมาก* covering all 6 formations), *Kon Makhos* (`กลหมากฮอส`) tactical puzzles with local rating, 4 Interactive Practice Modules (*2 ฮอส ไล่ 1 ฮอส*, *3 ฮอส ไล่ 1 ฮอส*, *ต่อเข้าฮอส*, *ควบคุมเส้นทแยงหลัก 4–29*), Play vs AI (Levels 1–8), Local 2P pass-and-play, and FEN/PDN import & export via `makhos-wasm` Web Worker.
+- **Retrograde Endgame Tablebases (`makhos-tb`) & Puzzle Miner (`makhos-mine`)**: Offline WDL/DTZ tablebase generator (`makhos-tbgen`) calibrated to the exact 32-ply draw rule, integrated into `Engine::analyze_with_tb` and `GET /api/tablebase?fen=...`, plus an engine-based tactical puzzle miner CLI.
 - **Self-Hosted Multiplayer (`makhos-server`)**: Real-time WebSocket rooms, `12+5` / `5+3` / `3+2` / unlimited matchmaking and private invite links (`?room=<id>`), authoritative millisecond server clocks, live spectators, SQLite WAL game/PDN archiving, Argon2id accounts, and Glicko-2 ratings.
 
 ---
@@ -46,6 +47,16 @@ Open `http://localhost:5173`.
 - `LIMAKHOS_BIND` (default `0.0.0.0:8080`)
 - `LIMAKHOS_DB` (default `data/limakhos.db`)
 - `LIMAKHOS_STATIC_DIR` (default `web/dist`)
+- `LIMAKHOS_TB_DIR` (default `data/tablebases` — optional directory of `.lmkt` tablebase files served via `GET /api/tablebase?fen=...`)
+
+### Offline CLIs (Tablebases & Puzzle Miner)
+```bash
+# Generate 2..=4 piece retrograde WDL/DTZ tablebases (calibrated to the 32-ply TCA draw rule)
+cargo run --release -p makhos-tb --bin makhos-tbgen -- --max-pieces 4 --out data/tablebases
+
+# Mine tactical Kon Makhos puzzles (eval swing >= 400 cp) from self-play or a PDN file
+cargo run --release -p makhos-engine --bin makhos-mine -- --games 12 --depth 6 --min-swing 400
+```
 
 ---
 

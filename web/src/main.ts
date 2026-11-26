@@ -13,9 +13,11 @@ import {
   type UserRecord,
 } from "./online/client";
 import { FORMATIONS, OPENING_BOOK, matchOpeningHistory } from "./study/openings";
+import { PRACTICE_MODULES, type PracticeDrill, type PracticeModule } from "./study/practice";
+import { KON_MAKHOS_PUZZLES, type KonMakhosPuzzle } from "./study/puzzles";
 import { evalToLightPercent, formatClockMs, formatEvalLight } from "./ui/eval";
 
-type PlayMode = "analysis" | "ai" | "local" | "online";
+type PlayMode = "analysis" | "ai" | "local" | "online" | "puzzles" | "practice";
 
 interface TimeControlOption {
   id: string;
@@ -33,6 +35,28 @@ const TIME_CONTROLS: TimeControlOption[] = [
 
 const LS_TOKEN_KEY = "limakhos_auth_token";
 const LS_GUEST_KEY = "limakhos_guest_name";
+const LS_STUDY_PROGRESS_KEY = "limakhos_study_progress_v1";
+
+interface StudyProgress {
+  puzzleRating: number;
+  solvedPuzzles: string[];
+  completedDrills: string[];
+}
+
+function loadStudyProgress(): StudyProgress {
+  try {
+    const raw = localStorage.getItem(LS_STUDY_PROGRESS_KEY);
+    if (!raw) return { puzzleRating: 1200, solvedPuzzles: [], completedDrills: [] };
+    const parsed = JSON.parse(raw) as Partial<StudyProgress>;
+    return {
+      puzzleRating: typeof parsed.puzzleRating === "number" ? parsed.puzzleRating : 1200,
+      solvedPuzzles: Array.isArray(parsed.solvedPuzzles) ? parsed.solvedPuzzles : [],
+      completedDrills: Array.isArray(parsed.completedDrills) ? parsed.completedDrills : [],
+    };
+  } catch {
+    return { puzzleRating: 1200, solvedPuzzles: [], completedDrills: [] };
+  }
+}
 
 interface HistoryEntry {
   fen: string;
@@ -99,6 +123,21 @@ class LimakhosApp {
   private onlineClockAnchorPerf = 0;
   private onlineSyncSeq = 0;
 
+  // Puzzles & Practice state
+  private studyProgress: StudyProgress = loadStudyProgress();
+  private activePuzzleIdx = 0;
+  private puzzleStep = 0;
+  private puzzleStatus: "solving" | "wrong" | "solved" | "revealed" = "solving";
+  private puzzleShowHint = false;
+  private puzzleHintArrow: BoardArrow | null = null;
+  private puzzleFailedAttempt = false;
+  private puzzleRunSeq = 0;
+
+  private activeModuleIdx = 0;
+  private activeDrillIdx = 0;
+  private practiceLiveEval = false;
+  private practiceHintArrow: BoardArrow | null = null;
+
   // DOM refs
   private root: HTMLElement;
   private boardMount!: HTMLElement;
@@ -109,6 +148,7 @@ class LimakhosApp {
   private bottomPlayerEl!: HTMLElement;
   private statusEl!: HTMLElement;
   private onlinePanelEl!: HTMLElement | null;
+  private studyPanelEl!: HTMLElement | null;
   private analysisPanelEl!: HTMLElement;
   private openingPanelEl!: HTMLElement | null;
   private movesPanelEl!: HTMLElement;
@@ -156,6 +196,8 @@ class LimakhosApp {
             <button class="tab-btn ${this.mode === "analysis" ? "is-active" : ""}" data-mode="analysis">${t.modeAnalysis}</button>
             <button class="tab-btn ${this.mode === "ai" ? "is-active" : ""}" data-mode="ai">${t.modeAi}</button>
             <button class="tab-btn ${this.mode === "local" ? "is-active" : ""}" data-mode="local">${t.modeLocal}</button>
+            <button class="tab-btn ${this.mode === "puzzles" ? "is-active" : ""}" data-mode="puzzles">${t.modePuzzles}</button>
+            <button class="tab-btn ${this.mode === "practice" ? "is-active" : ""}" data-mode="practice">${t.modePractice}</button>
             <button class="tab-btn ${this.mode === "online" ? "is-active" : ""}" data-mode="online">${t.modeOnline}</button>
           </div>
           <button class="btn" id="btn-locale">${this.locale === "th" ? "EN" : "ไทย"}</button>
@@ -195,6 +237,7 @@ class LimakhosApp {
         <aside class="side-column">
           <div id="status-box"></div>
           ${this.mode === "online" ? `<div id="online-panel" class="online-stack"></div>` : ""}
+          ${this.mode === "puzzles" || this.mode === "practice" ? `<div id="study-panel" class="online-stack"></div>` : ""}
 
           ${
             this.mode === "ai" || this.mode === "local"
@@ -270,6 +313,7 @@ class LimakhosApp {
     this.bottomPlayerEl = this.root.querySelector("#bottom-player")!;
     this.statusEl = this.root.querySelector("#status-box")!;
     this.onlinePanelEl = this.root.querySelector("#online-panel");
+    this.studyPanelEl = this.root.querySelector("#study-panel");
     this.analysisPanelEl = this.root.querySelector("#analysis-card")!;
     this.openingPanelEl = this.root.querySelector("#opening-card");
     this.movesPanelEl = this.root.querySelector("#moves-card")!;
@@ -304,7 +348,8 @@ class LimakhosApp {
         if (nextMode === this.mode) return;
         this.leaveOnlineRoom(false);
         this.mode = nextMode;
-        this.analysisEnabled = nextMode === "analysis";
+        this.analysisEnabled =
+          nextMode === "analysis" || (nextMode === "practice" && this.practiceLiveEval);
         if (nextMode === "ai") {
           this.orientation = this.humanColor;
         }
@@ -312,6 +357,10 @@ class LimakhosApp {
         if (nextMode === "online") {
           void this.startNewGame();
           void this.refreshOnlineLobby();
+        } else if (nextMode === "puzzles") {
+          void this.loadPuzzle(this.activePuzzleIdx);
+        } else if (nextMode === "practice") {
+          void this.loadPracticeDrill(this.activeModuleIdx, this.activeDrillIdx);
         } else {
           void this.startNewGame();
         }
@@ -323,7 +372,15 @@ class LimakhosApp {
       this.renderShell();
     });
 
-    this.root.querySelector("#btn-new")?.addEventListener("click", () => void this.startNewGame());
+    this.root.querySelector("#btn-new")?.addEventListener("click", () => {
+      if (this.mode === "puzzles") {
+        void this.loadPuzzle(this.activePuzzleIdx);
+      } else if (this.mode === "practice") {
+        void this.loadPracticeDrill(this.activeModuleIdx, this.activeDrillIdx);
+      } else {
+        void this.startNewGame();
+      }
+    });
     this.root.querySelector("#btn-leave-room")?.addEventListener("click", () => {
       this.leaveOnlineRoom(true);
     });
@@ -481,6 +538,18 @@ class LimakhosApp {
       if (!this.isAtLatestPly()) return false;
       return this.onlineRole === this.onlineState.side_to_move;
     }
+    if (this.mode === "puzzles") {
+      return (
+        this.isAtLatestPly() &&
+        (this.puzzleStatus === "solving" || this.puzzleStatus === "wrong")
+      );
+    }
+    if (this.mode === "practice") {
+      return (
+        this.isAtLatestPly() &&
+        this.currentSnapshot.side_to_move === this.activePracticeDrill().humanColor
+      );
+    }
     if (this.mode === "analysis") return true;
     if (!this.isAtLatestPly()) return false;
     if (this.mode === "ai") {
@@ -499,6 +568,11 @@ class LimakhosApp {
       this.onlineConn?.sendMove(move.long_notation);
       return;
     }
+    if (this.mode === "puzzles") {
+      await this.handlePuzzleUserMove(move);
+      return;
+    }
+    this.practiceHintArrow = null;
     await this.commitNotation(move.long_notation);
   }
 
@@ -526,8 +600,15 @@ class LimakhosApp {
     if (tc.initialMs > 0 && (this.mode === "ai" || this.mode === "local")) {
       this.clocksMs[mover] += tc.incrementMs;
     }
-    if (this.effectiveOutcome().type !== "ongoing") {
+    const outcome = this.effectiveOutcome();
+    if (outcome.type !== "ongoing") {
       this.stopClock();
+      if (this.mode === "practice") {
+        const drill = this.activePracticeDrill();
+        if (outcome.type === "win" && outcome.winner === drill.humanColor) {
+          this.markDrillCompleted(drill.id);
+        }
+      }
     }
 
     this.syncBoard();
@@ -537,10 +618,13 @@ class LimakhosApp {
   }
 
   private async maybeTriggerAiTurn(): Promise<void> {
-    if (this.mode !== "ai" || !this.currentSnapshot) return;
+    if ((this.mode !== "ai" && this.mode !== "practice") || !this.currentSnapshot) return;
     if (this.effectiveOutcome().type !== "ongoing") return;
     if (!this.isAtLatestPly()) return;
-    if (this.currentSnapshot.side_to_move === this.humanColor) return;
+    const targetHuman =
+      this.mode === "practice" ? this.activePracticeDrill().humanColor : this.humanColor;
+    const level = this.mode === "practice" ? this.activePracticeDrill().aiLevel : this.aiLevel;
+    if (this.currentSnapshot.side_to_move === targetHuman) return;
 
     this.aiThinking = true;
     this.syncBoard();
@@ -548,10 +632,11 @@ class LimakhosApp {
 
     const fen = this.currentSnapshot.fen;
     const hashes = this.historyHashesUpTo(this.cursor);
+    const modeAtStart = this.mode;
     try {
-      const { chosen, analysis } = await this.engine.aiMove(fen, this.aiLevel, hashes);
+      const { chosen, analysis } = await this.engine.aiMove(fen, level, hashes);
       this.aiThinking = false;
-      if (this.currentSnapshot?.fen !== fen || this.mode !== "ai") return;
+      if (this.currentSnapshot?.fen !== fen || this.mode !== modeAtStart) return;
       if (this.analysisEnabled) {
         this.lastAnalysis = analysis;
       }
@@ -627,8 +712,10 @@ class LimakhosApp {
   }
 
   private async handleUndo(): Promise<void> {
-    if (this.mode === "online" || this.cursor === 0 || this.aiThinking) return;
-    const steps = this.mode === "ai" && this.cursor >= 2 ? 2 : 1;
+    if (this.mode === "online" || this.mode === "puzzles" || this.cursor === 0 || this.aiThinking) {
+      return;
+    }
+    const steps = (this.mode === "ai" || this.mode === "practice") && this.cursor >= 2 ? 2 : 1;
     this.timeline = this.timeline.slice(0, this.cursor - steps + 1);
     this.cursor = this.timeline.length - 1;
     this.forcedOutcome = null;
@@ -968,18 +1055,27 @@ class LimakhosApp {
   // --- Rendering ---
 
   private computeBoardArrows(): BoardArrow[] {
-    if (!this.analysisEnabled || !this.lastAnalysis || this.lastAnalysis.lines.length === 0) {
-      return [];
+    if (this.mode === "puzzles") {
+      return this.puzzleHintArrow ? [this.puzzleHintArrow] : [];
     }
-    const palette = ["#22c55e", "#38bdf8", "#f59e0b"];
-    return this.lastAnalysis.lines.slice(0, 3).map((line, i) => ({
-      from: line.best_move.from,
-      to: line.best_move.to,
-      path: line.best_move.path,
-      color: palette[i] ?? "#38bdf8",
-      opacity: i === 0 ? 0.84 : 0.48,
-      width: i === 0 ? 15 : 10,
-    }));
+    const arrows: BoardArrow[] = [];
+    if (this.mode === "practice" && this.practiceHintArrow) {
+      arrows.push(this.practiceHintArrow);
+    }
+    if (this.analysisEnabled && this.lastAnalysis && this.lastAnalysis.lines.length > 0) {
+      const palette = ["#22c55e", "#38bdf8", "#f59e0b"];
+      this.lastAnalysis.lines.slice(0, 3).forEach((line, i) => {
+        arrows.push({
+          from: line.best_move.from,
+          to: line.best_move.to,
+          path: line.best_move.path,
+          color: palette[i] ?? "#38bdf8",
+          opacity: i === 0 ? 0.84 : 0.48,
+          width: i === 0 ? 15 : 10,
+        });
+      });
+    }
+    return arrows;
   }
 
   private syncBoard(): void {
@@ -1001,6 +1097,9 @@ class LimakhosApp {
     this.renderStatusBanner();
     if (this.mode === "online") {
       this.renderOnlinePanel();
+    }
+    if (this.mode === "puzzles" || this.mode === "practice") {
+      this.renderStudyPanel();
     }
     this.renderEvalBar();
     this.renderAnalysisPanel();
@@ -1426,7 +1525,11 @@ class LimakhosApp {
   }
 
   private renderAnalysisPanel(): void {
-    if (this.mode === "online" && this.onlineState?.status === "active") {
+    if (
+      (this.mode === "online" && this.onlineState?.status === "active") ||
+      this.mode === "puzzles" ||
+      (this.mode === "practice" && !this.practiceLiveEval)
+    ) {
       this.analysisPanelEl.style.display = "none";
       return;
     }
@@ -1709,6 +1812,393 @@ class LimakhosApp {
       this.cursor = this.timeline.length - 1;
       void this.inspectCursor();
     });
+  }
+
+  // --- Puzzles & Practice (100% offline WASM) ---
+
+  private saveStudyProgress(): void {
+    try {
+      localStorage.setItem(LS_STUDY_PROGRESS_KEY, JSON.stringify(this.studyProgress));
+    } catch {
+      // Ignore storage quota errors
+    }
+  }
+
+  private activePuzzle(): KonMakhosPuzzle {
+    return KON_MAKHOS_PUZZLES[this.activePuzzleIdx] ?? KON_MAKHOS_PUZZLES[0];
+  }
+
+  private activePracticeModule(): PracticeModule {
+    return PRACTICE_MODULES[this.activeModuleIdx] ?? PRACTICE_MODULES[0];
+  }
+
+  private activePracticeDrill(): PracticeDrill {
+    const mod = this.activePracticeModule();
+    return mod.drills[this.activeDrillIdx] ?? mod.drills[0];
+  }
+
+  private async loadPuzzle(idx: number): Promise<void> {
+    const safeIdx = ((idx % KON_MAKHOS_PUZZLES.length) + KON_MAKHOS_PUZZLES.length) % KON_MAKHOS_PUZZLES.length;
+    this.activePuzzleIdx = safeIdx;
+    this.puzzleStep = 0;
+    this.puzzleStatus = "solving";
+    this.puzzleShowHint = false;
+    this.puzzleHintArrow = null;
+    this.puzzleFailedAttempt = false;
+    const seq = ++this.puzzleRunSeq;
+
+    this.stopClock();
+    this.forcedOutcome = null;
+    this.aiThinking = false;
+    this.lastAnalysis = null;
+
+    const puzzle = this.activePuzzle();
+    const snap = await this.engine.inspect(puzzle.fen);
+    if (seq !== this.puzzleRunSeq || this.mode !== "puzzles") return;
+
+    this.orientation = snap.side_to_move;
+    this.timeline = [{ fen: snap.fen, hash: snap.hash, notation: null, lastMove: null }];
+    this.cursor = 0;
+    this.currentSnapshot = snap;
+    this.syncBoard();
+    this.refreshPanels();
+  }
+
+  private async handlePuzzleUserMove(move: MoveDto): Promise<void> {
+    if (!this.currentSnapshot) return;
+    const puzzle = this.activePuzzle();
+    const expected = puzzle.solution[this.puzzleStep];
+    if (!expected) return;
+
+    const isCorrect =
+      move.long_notation === expected ||
+      move.notation === expected ||
+      move.short_notation === expected;
+
+    if (!isCorrect) {
+      this.puzzleStatus = "wrong";
+      if (!this.puzzleFailedAttempt) {
+        this.puzzleFailedAttempt = true;
+        this.studyProgress.puzzleRating = Math.max(800, this.studyProgress.puzzleRating - 12);
+        this.saveStudyProgress();
+      }
+      this.syncBoard();
+      this.renderStudyPanel();
+      return;
+    }
+
+    this.puzzleHintArrow = null;
+    this.puzzleShowHint = false;
+    this.puzzleStatus = "solving";
+    const seq = ++this.puzzleRunSeq;
+    await this.commitNotation(move.long_notation);
+    if (seq !== this.puzzleRunSeq || this.mode !== "puzzles") return;
+
+    this.puzzleStep += 1;
+    if (this.puzzleStep >= puzzle.solution.length) {
+      this.finishPuzzleSolved(puzzle);
+      return;
+    }
+
+    // Auto-play opponent's forced reply along the solution line
+    this.aiThinking = true;
+    this.syncBoard();
+    this.renderStudyPanel();
+
+    window.setTimeout(async () => {
+      if (seq !== this.puzzleRunSeq || this.mode !== "puzzles") return;
+      const reply = puzzle.solution[this.puzzleStep];
+      this.aiThinking = false;
+      if (!reply) return;
+      await this.commitNotation(reply);
+      if (seq !== this.puzzleRunSeq || this.mode !== "puzzles") return;
+      this.puzzleStep += 1;
+      if (this.puzzleStep >= puzzle.solution.length) {
+        this.finishPuzzleSolved(puzzle);
+      } else {
+        this.syncBoard();
+        this.renderStudyPanel();
+      }
+    }, 240);
+  }
+
+  private finishPuzzleSolved(puzzle: KonMakhosPuzzle): void {
+    this.puzzleStatus = "solved";
+    if (!this.puzzleFailedAttempt && !this.studyProgress.solvedPuzzles.includes(puzzle.id)) {
+      const expectedScore = 1 / (1 + Math.pow(10, (puzzle.rating - this.studyProgress.puzzleRating) / 400));
+      const gain = Math.max(8, Math.round(28 * (1 - expectedScore)));
+      this.studyProgress.puzzleRating += gain;
+      this.studyProgress.solvedPuzzles.push(puzzle.id);
+      this.saveStudyProgress();
+    } else if (!this.studyProgress.solvedPuzzles.includes(puzzle.id)) {
+      this.studyProgress.solvedPuzzles.push(puzzle.id);
+      this.saveStudyProgress();
+    }
+    this.syncBoard();
+    this.renderStudyPanel();
+  }
+
+  private showPuzzleHint(): void {
+    if (!this.currentSnapshot) return;
+    const puzzle = this.activePuzzle();
+    const expected = puzzle.solution[this.puzzleStep];
+    if (!expected) return;
+    const match = this.currentSnapshot.legal_moves.find(
+      (m) => m.long_notation === expected || m.notation === expected || m.short_notation === expected,
+    );
+    if (match) {
+      this.puzzleHintArrow = {
+        from: match.from,
+        to: match.to,
+        path: match.path,
+        color: "#f59e0b",
+        opacity: 0.9,
+        width: 14,
+      };
+    }
+    this.puzzleShowHint = true;
+    this.syncBoard();
+    this.renderStudyPanel();
+  }
+
+  private async revealPuzzleSolution(): Promise<void> {
+    const puzzle = this.activePuzzle();
+    this.puzzleFailedAttempt = true;
+    this.puzzleHintArrow = null;
+    this.puzzleShowHint = true;
+    this.aiThinking = false;
+    const seq = ++this.puzzleRunSeq;
+
+    // Replay from puzzle start so solution is cleanly visible in move history
+    const startSnap = await this.engine.inspect(puzzle.fen);
+    if (seq !== this.puzzleRunSeq || this.mode !== "puzzles") return;
+    const timeline: HistoryEntry[] = [
+      { fen: startSnap.fen, hash: startSnap.hash, notation: null, lastMove: null },
+    ];
+    let curFen = startSnap.fen;
+    let curSnap = startSnap;
+    const hashes = [startSnap.hash];
+    for (const tok of puzzle.solution) {
+      const res = await this.engine.applyMove(curFen, tok, hashes);
+      if (seq !== this.puzzleRunSeq || this.mode !== "puzzles") return;
+      timeline.push({
+        fen: res.snapshot.fen,
+        hash: res.snapshot.hash,
+        notation: res.notation,
+        lastMove: { from: res.applied.from, to: res.applied.to, path: res.applied.path },
+      });
+      curFen = res.snapshot.fen;
+      curSnap = res.snapshot;
+      hashes.push(res.snapshot.hash);
+    }
+    this.timeline = timeline;
+    this.cursor = timeline.length - 1;
+    this.currentSnapshot = curSnap;
+    this.puzzleStep = puzzle.solution.length;
+    this.puzzleStatus = "revealed";
+    this.syncBoard();
+    this.refreshPanels();
+  }
+
+  private async loadPracticeDrill(moduleIdx: number, drillIdx: number): Promise<void> {
+    this.activeModuleIdx = Math.max(0, Math.min(PRACTICE_MODULES.length - 1, moduleIdx));
+    const mod = this.activePracticeModule();
+    this.activeDrillIdx = Math.max(0, Math.min(mod.drills.length - 1, drillIdx));
+    const drill = this.activePracticeDrill();
+    this.orientation = drill.humanColor;
+    this.practiceHintArrow = null;
+    this.analysisEnabled = this.practiceLiveEval;
+    await this.startNewGame(drill.fen);
+  }
+
+  private markDrillCompleted(drillId: string): void {
+    if (!this.studyProgress.completedDrills.includes(drillId)) {
+      this.studyProgress.completedDrills.push(drillId);
+      this.saveStudyProgress();
+    }
+  }
+
+  private async showPracticeHint(): Promise<void> {
+    if (!this.currentSnapshot || this.mode !== "practice") return;
+    const fen = this.currentSnapshot.fen;
+    const res = await this.engine.analyze(fen, {
+      maxDepth: 6,
+      maxNodes: 150_000,
+      multipv: 1,
+      historyHashes: this.historyHashesUpTo(this.cursor),
+    });
+    if (this.currentSnapshot?.fen !== fen || this.mode !== "practice") return;
+    const top = res.lines[0];
+    if (top) {
+      this.practiceHintArrow = {
+        from: top.best_move.from,
+        to: top.best_move.to,
+        path: top.best_move.path,
+        color: "#22c55e",
+        opacity: 0.9,
+        width: 14,
+      };
+      this.syncBoard();
+    }
+  }
+
+  private renderStudyPanel(): void {
+    if (!this.studyPanelEl) return;
+    const t = this.t();
+    const isTh = this.locale === "th";
+
+    if (this.mode === "puzzles") {
+      const puzzle = this.activePuzzle();
+      const isSolved = this.studyProgress.solvedPuzzles.includes(puzzle.id);
+
+      let feedbackHtml = `<div class="study-feedback">${escapeHtml(t.puzzlePrompt)}</div>`;
+      if (this.puzzleStatus === "wrong") {
+        feedbackHtml = `<div class="study-feedback is-bad">${escapeHtml(t.puzzleWrong)}</div>`;
+      } else if (this.puzzleStatus === "solved") {
+        feedbackHtml = `<div class="study-feedback is-good">${escapeHtml(t.puzzleSolved)}</div>`;
+      } else if (this.puzzleStatus === "revealed") {
+        feedbackHtml = `<div class="study-feedback is-hint">${escapeHtml(t.puzzleRevealed)}</div>`;
+      } else if (this.puzzleShowHint) {
+        feedbackHtml = `<div class="study-feedback is-hint">${escapeHtml(
+          isTh ? puzzle.hintTh : puzzle.hintEn,
+        )}</div>`;
+      }
+
+      const listHtml = KON_MAKHOS_PUZZLES.map((p, idx) => {
+        const done = this.studyProgress.solvedPuzzles.includes(p.id);
+        const active = idx === this.activePuzzleIdx;
+        return `
+          <button class="study-item ${active ? "is-active" : ""} ${done ? "is-done" : ""}" data-puzzle-idx="${idx}">
+            <span>${done ? "✓ " : ""}#${idx + 1} ${escapeHtml(isTh ? p.titleTh : p.titleEn)}</span>
+            <span class="badge-muted">${p.rating}</span>
+          </button>
+        `;
+      }).join("");
+
+      this.studyPanelEl.innerHTML = `
+        <div class="card">
+          <div class="card-header">
+            <h2 class="card-title">${t.puzzleTitle}</h2>
+            <span class="pill">${t.puzzleRating}: ${this.studyProgress.puzzleRating}</span>
+          </div>
+          <div class="inline-row" style="justify-content:space-between;margin-bottom:8px;">
+            <strong>${isSolved ? "✓ " : ""}${escapeHtml(isTh ? puzzle.titleTh : puzzle.titleEn)}</strong>
+            <span class="pill">${escapeHtml(isTh ? puzzle.themeTh : puzzle.themeEn)} • ${puzzle.rating}</span>
+          </div>
+          ${feedbackHtml}
+          <div class="inline-row">
+            <button class="btn" id="btn-puzzle-hint">${t.puzzleHint}</button>
+            <button class="btn" id="btn-puzzle-reveal">${t.puzzleShowSolution}</button>
+            <button class="btn" id="btn-puzzle-retry">${t.puzzleRetry}</button>
+            <button class="btn is-primary" id="btn-puzzle-next">${t.puzzleNext}</button>
+          </div>
+        </div>
+        <div class="card">
+          <div class="card-header">
+            <h2 class="card-title">${t.puzzleSolvedCount}: ${this.studyProgress.solvedPuzzles.length}/${KON_MAKHOS_PUZZLES.length}</h2>
+          </div>
+          <div class="study-list">${listHtml}</div>
+        </div>
+      `;
+
+      this.studyPanelEl.querySelector("#btn-puzzle-hint")?.addEventListener("click", () => this.showPuzzleHint());
+      this.studyPanelEl
+        .querySelector("#btn-puzzle-reveal")
+        ?.addEventListener("click", () => void this.revealPuzzleSolution());
+      this.studyPanelEl
+        .querySelector("#btn-puzzle-retry")
+        ?.addEventListener("click", () => void this.loadPuzzle(this.activePuzzleIdx));
+      this.studyPanelEl
+        .querySelector("#btn-puzzle-next")
+        ?.addEventListener("click", () => void this.loadPuzzle(this.activePuzzleIdx + 1));
+      this.studyPanelEl.querySelectorAll<HTMLButtonElement>("[data-puzzle-idx]").forEach((btn) => {
+        btn.addEventListener("click", () => {
+          void this.loadPuzzle(Number(btn.dataset.puzzleIdx));
+        });
+      });
+      return;
+    }
+
+    if (this.mode === "practice") {
+      const mod = this.activePracticeModule();
+      const drill = this.activePracticeDrill();
+      const outcome = this.effectiveOutcome();
+      const drillDone = this.studyProgress.completedDrills.includes(drill.id);
+
+      let bannerHtml = `<div class="study-feedback">${escapeHtml(isTh ? drill.goalTh : drill.goalEn)}</div>`;
+      if (outcome.type === "win" && outcome.winner === drill.humanColor) {
+        bannerHtml = `<div class="study-feedback is-good">${escapeHtml(t.practiceWinMsg)}</div>`;
+      } else if (outcome.type !== "ongoing") {
+        bannerHtml = `<div class="study-feedback is-bad">${escapeHtml(t.practiceFailMsg)}</div>`;
+      }
+
+      const modulesHtml = PRACTICE_MODULES.map((m, idx) => {
+        const active = idx === this.activeModuleIdx;
+        return `<button class="module-tab ${active ? "is-active" : ""}" data-mod-idx="${idx}">${escapeHtml(
+          isTh ? m.titleTh : m.titleEn,
+        )}</button>`;
+      }).join("");
+
+      const drillsHtml = mod.drills
+        .map((d, idx) => {
+          const active = idx === this.activeDrillIdx;
+          const done = this.studyProgress.completedDrills.includes(d.id);
+          return `
+            <button class="study-item ${active ? "is-active" : ""} ${done ? "is-done" : ""}" data-drill-idx="${idx}">
+              <span>${done ? "✓ " : ""}${escapeHtml(isTh ? d.titleTh : d.titleEn)}</span>
+              <span class="badge-muted">AI L${d.aiLevel}</span>
+            </button>
+          `;
+        })
+        .join("");
+
+      this.studyPanelEl.innerHTML = `
+        <div class="card">
+          <div class="card-header">
+            <h2 class="card-title">${t.practiceTitle}</h2>
+            <span class="pill">${t.practiceCompleted}: ${this.studyProgress.completedDrills.length}/${PRACTICE_MODULES.reduce((s, m) => s + m.drills.length, 0)}</span>
+          </div>
+          <div class="module-tabs">${modulesHtml}</div>
+          <div class="opening-note" style="margin-bottom:8px;">${escapeHtml(
+            isTh ? mod.descriptionTh : mod.descriptionEn,
+          )}</div>
+          ${bannerHtml}
+          <div class="inline-row" style="margin-bottom:10px;">
+            <button class="btn is-primary" id="btn-practice-retry">${t.practiceRetry}</button>
+            <button class="btn" id="btn-practice-hint">${t.practiceHint}</button>
+            <button class="btn ${this.practiceLiveEval ? "is-active" : ""}" id="btn-practice-eval">Eval</button>
+          </div>
+          <div class="study-list">${drillsHtml}</div>
+          ${drillDone ? "" : ""}
+        </div>
+      `;
+
+      this.studyPanelEl.querySelector("#btn-practice-retry")?.addEventListener("click", () => {
+        void this.loadPracticeDrill(this.activeModuleIdx, this.activeDrillIdx);
+      });
+      this.studyPanelEl.querySelector("#btn-practice-hint")?.addEventListener("click", () => {
+        void this.showPracticeHint();
+      });
+      this.studyPanelEl.querySelector("#btn-practice-eval")?.addEventListener("click", () => {
+        this.practiceLiveEval = !this.practiceLiveEval;
+        this.analysisEnabled = this.practiceLiveEval;
+        this.syncBoard();
+        this.renderEvalBar();
+        this.renderAnalysisPanel();
+        this.renderStudyPanel();
+        if (this.analysisEnabled) void this.triggerAnalysisIfEnabled();
+      });
+      this.studyPanelEl.querySelectorAll<HTMLButtonElement>("[data-mod-idx]").forEach((btn) => {
+        btn.addEventListener("click", () => {
+          void this.loadPracticeDrill(Number(btn.dataset.modIdx), 0);
+        });
+      });
+      this.studyPanelEl.querySelectorAll<HTMLButtonElement>("[data-drill-idx]").forEach((btn) => {
+        btn.addEventListener("click", () => {
+          void this.loadPracticeDrill(this.activeModuleIdx, Number(btn.dataset.drillIdx));
+        });
+      });
+    }
   }
 
   private showToast(msg: string): void {

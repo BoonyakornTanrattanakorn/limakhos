@@ -8,3 +8,4 @@ description = "32-bit bitboard alpha-beta AI and Multi-PV analysis engine for Th
 [dependencies]
 makhos-core = { path = "../makhos-core" }
 serde = { workspace = true }
+serde_json = { workspace = true }

@@ -84,6 +84,25 @@ export interface Messages {
   openingStartHint: string;
   openingFirstMover: string;
   openingSecondMover: string;
+  modePuzzles: string;
+  modePractice: string;
+  puzzleTitle: string;
+  puzzleRating: string;
+  puzzleSolvedCount: string;
+  puzzleHint: string;
+  puzzleShowSolution: string;
+  puzzleRetry: string;
+  puzzleNext: string;
+  puzzlePrompt: string;
+  puzzleWrong: string;
+  puzzleSolved: string;
+  puzzleRevealed: string;
+  practiceTitle: string;
+  practiceCompleted: string;
+  practiceRetry: string;
+  practiceHint: string;
+  practiceWinMsg: string;
+  practiceFailMsg: string;
 }
 
 export const MESSAGES: Record<Locale, Messages> = {
@@ -171,6 +190,25 @@ export const MESSAGES: Record<Locale, Messages> = {
     openingStartHint: "Pick a formation or play a book move to explore canonical Thai openings:",
     openingFirstMover: "Light (1st)",
     openingSecondMover: "Dark (2nd)",
+    modePuzzles: "Puzzles",
+    modePractice: "Practice",
+    puzzleTitle: "Kon Makhos Puzzles (กลหมากฮอส)",
+    puzzleRating: "Puzzle Rating",
+    puzzleSolvedCount: "Solved",
+    puzzleHint: "Hint",
+    puzzleShowSolution: "Show Solution",
+    puzzleRetry: "Retry",
+    puzzleNext: "Next Puzzle",
+    puzzlePrompt: "Find the winning tactic on the board.",
+    puzzleWrong: "Not the best move — try again!",
+    puzzleSolved: "Solved! Excellent tactic.",
+    puzzleRevealed: "Solution revealed. Try the next puzzle!",
+    practiceTitle: "Interactive Practice",
+    practiceCompleted: "Completed",
+    practiceRetry: "Restart Drill",
+    practiceHint: "Engine Hint",
+    practiceWinMsg: "Drill mastered! You converted the winning position.",
+    practiceFailMsg: "Drill missed (draw/loss) — restart and try again!",
   },
   th: {
     appTitle: "Limakhos",
@@ -256,5 +294,24 @@ export const MESSAGES: Record<Locale, Messages> = {
     openingStartHint: "เลือกทรงหมากมาตรฐานหรือคลิกตาเดินในตำราเพื่อศึกษาแนวการเปิดหมาก:",
     openingFirstMover: "ฝ่ายเดินก่อน (1–8)",
     openingSecondMover: "ฝ่ายเดินหลัง (25–32)",
+    modePuzzles: "กลหมากฮอส",
+    modePractice: "ฝึกซ้อม",
+    puzzleTitle: "ปริศนากลหมากฮอส (Kon Makhos)",
+    puzzleRating: "เรตติ้งกลหมาก",
+    puzzleSolvedCount: "ผ่านแล้ว",
+    puzzleHint: "คำใบ้",
+    puzzleShowSolution: "ดูเฉลย",
+    puzzleRetry: "ลองใหม่",
+    puzzleNext: "ข้อถัดไป",
+    puzzlePrompt: "เดินตาที่ดีที่สุดเพื่อชิงความได้เปรียบหรือปิดเกม",
+    puzzleWrong: "ยังไม่ถูกต้อง — ลองหาตาที่ดีกว่านี้!",
+    puzzleSolved: "ยอดเยี่ยม! แก้กลหมากฮอสสำเร็จ",
+    puzzleRevealed: "แสดงเฉลยแล้ว — ลองฝึกข้อถัดไปได้เลย",
+    practiceTitle: "บทฝึกซ้อมเชิงโต้ตอบ (Practice)",
+    practiceCompleted: "ผ่านแล้ว",
+    practiceRetry: "เริ่มด่านใหม่",
+    practiceHint: "ขอคำแนะนำ AI",
+    practiceWinMsg: "ผ่านด่านสำเร็จ! ปิดเกมได้อย่างแม่นยำ",
+    practiceFailMsg: "ยังไม่ผ่านด่าน (เสมอ/แพ้) — กดเริ่มใหม่เพื่อลองอีกครั้ง",
   },
 };

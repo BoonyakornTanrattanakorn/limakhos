@@ -493,6 +493,7 @@ version = "0.1.0"
 dependencies = [
  "makhos-core",
  "serde",
+ "serde_json",
 ]
 
 [[package]]
