@@ -1,0 +1,26 @@
+# Rust
+/target
+**/*.rs.bk
+*.pdb
+
+# Node / Frontend
+web/node_modules/
+web/dist/
+web/.vite/
+web/public/wasm/*.wasm
+npm-debug.log*
+
+# Local runtime data & generated tablebases
+data/
+*.db
+*.db-shm
+*.db-wal
+*.tb
+
+# OS / Editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+.env
+.env.local

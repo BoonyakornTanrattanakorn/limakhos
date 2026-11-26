@@ -1,0 +1,22 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/makhos-core",
+    "crates/makhos-engine",
+    "crates/makhos-wasm",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["Limakhos Contributors"]
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1

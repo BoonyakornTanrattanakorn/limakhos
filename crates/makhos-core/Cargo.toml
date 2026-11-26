@@ -1,0 +1,9 @@
+[package]
+name = "makhos-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Core rules, bitboard representation, move generation, and PDN/FEN for 8-piece Thai Draughts (Makhos 8 — TCA 2025)"
+
+[dependencies]
+serde = { workspace = true }
