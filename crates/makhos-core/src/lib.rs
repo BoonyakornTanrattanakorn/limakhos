@@ -1,6 +1,7 @@
 //! Core rules, bitboard representation, move generation, and PDN/FEN for
 //! 8-piece Thai Draughts (Makhos 8 — Thailand Chess Association B.E. 2568 / 2025).
 
+pub mod fast_move;
 pub mod game;
 pub mod moves;
 pub mod notation;
@@ -8,13 +9,19 @@ pub mod position;
 pub mod square;
 pub mod zobrist;
 
+pub use fast_move::{
+    apply_fast_move, apply_null_move, generate_fast_captures, generate_fast_captures_known,
+    generate_fast_legal_moves, generate_fast_quiet_moves, validate_fast_quiet_move, FastMove,
+    FastMoveList,
+};
 pub use game::{DrawReason, GameOutcome, GameState, WinReason};
 pub use moves::Move;
 pub use notation::{from_fen, from_pdn, resolve_move_notation, to_fen, to_pdn};
 pub use position::{Color, Piece, PieceKind, Position, MAX_KING_ONLY_PLIES};
 pub use square::{
-    Dir, Square, ALL_DIRS, DARK_BACK_RANK_MASK, DARK_START_MASK, LIGHT_BACK_RANK_MASK,
-    LIGHT_START_MASK, MAIN_DIAGONAL_MASK,
+    first_blocker_idx, ray_mask, step_idx, Dir, Square, ALL_DIRS, ALL_RAY_MASK, BETWEEN_MASK,
+    DARK_BACK_RANK_MASK, DARK_START_MASK, LIGHT_BACK_RANK_MASK, LIGHT_START_MASK,
+    MAIN_DIAGONAL_MASK, RAY_MASK,
 };
 
 #[cfg(test)]

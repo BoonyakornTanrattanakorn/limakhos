@@ -1,0 +1,23 @@
+services:
+  limakhos:
+    build: .
+    container_name: limakhos-server
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./data:/data
+    environment:
+      LIMAKHOS_BIND: 0.0.0.0:8080
+      LIMAKHOS_DB: /data/limakhos.db
+      LIMAKHOS_STATIC_DIR: /app/web/dist
+      RUST_LOG: makhos_server=info,tower_http=info
+    restart: unless-stopped
+
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: limakhos-cloudflared
+    profiles: ["tunnel"]
+    command: tunnel --no-autoupdate run --token ${CLOUDFLARE_TUNNEL_TOKEN}
+    depends_on:
+      - limakhos
+    restart: unless-stopped

@@ -11,5 +11,6 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 makhos-core = { path = "../makhos-core" }
 makhos-engine = { path = "../makhos-engine" }
+makhos-tb = { path = "../makhos-tb" }
 serde = { workspace = true }
 serde_json = { workspace = true }

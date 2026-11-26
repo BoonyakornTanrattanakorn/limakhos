@@ -144,6 +144,115 @@ impl Square {
     }
 }
 
+/// Bitmask of all squares strictly along ray `dir` starting after square index `0..32`.
+pub const RAY_MASK: [[u32; 4]; 32] = {
+    let mut table = [[0u32; 4]; 32];
+    let mut idx = 0usize;
+    while idx < 32 {
+        let sq = Square::new_unchecked((idx + 1) as u8);
+        let (r0, c0) = sq.to_row_col();
+        let mut d = 0usize;
+        while d < 4 {
+            let (dr, dc) = dir_delta(d);
+            let mut r = r0 as i8 + dr;
+            let mut c = c0 as i8 + dc;
+            let mut mask = 0u32;
+            while let Some(next) = Square::from_row_col(r, c) {
+                mask |= 1u32 << next.index();
+                r += dr;
+                c += dc;
+            }
+            table[idx][d] = mask;
+            d += 1;
+        }
+        idx += 1;
+    }
+    table
+};
+
+/// Bitmask union of all 4 diagonal rays starting after square index `0..32`.
+pub const ALL_RAY_MASK: [u32; 32] = {
+    let mut table = [0u32; 32];
+    let mut idx = 0usize;
+    while idx < 32 {
+        let r = RAY_MASK[idx];
+        table[idx] = r[0] | r[1] | r[2] | r[3];
+        idx += 1;
+    }
+    table
+};
+
+/// Bitmask of squares strictly between two squares on the same diagonal (`0` if not collinear).
+pub const BETWEEN_MASK: [[u32; 32]; 32] = {
+    let mut table = [[0u32; 32]; 32];
+    let mut a = 0usize;
+    while a < 32 {
+        let sq = Square::new_unchecked((a + 1) as u8);
+        let (r0, c0) = sq.to_row_col();
+        let mut d = 0usize;
+        while d < 4 {
+            let (dr, dc) = dir_delta(d);
+            let mut r = r0 as i8 + dr;
+            let mut c = c0 as i8 + dc;
+            let mut between = 0u32;
+            while let Some(next) = Square::from_row_col(r, c) {
+                let b = next.index();
+                table[a][b] = between;
+                between |= 1u32 << b;
+                r += dr;
+                c += dc;
+            }
+            d += 1;
+        }
+        a += 1;
+    }
+    table
+};
+
+/// Next square index (`0..=31`) in direction `dir`, or `255` (`0xFF`) if off-board.
+pub const STEP_IDX: [[u8; 4]; 32] = {
+    let mut table = [[255u8; 4]; 32];
+    let mut idx = 0usize;
+    while idx < 32 {
+        let sq = Square::new_unchecked((idx + 1) as u8);
+        let (r, c) = sq.to_row_col();
+        let mut d = 0usize;
+        while d < 4 {
+            let (dr, dc) = dir_delta(d);
+            if let Some(next) = Square::from_row_col(r as i8 + dr, c as i8 + dc) {
+                table[idx][d] = next.index() as u8;
+            }
+            d += 1;
+        }
+        idx += 1;
+    }
+    table
+};
+
+/// Returns the precomputed bitmask of all squares strictly along ray `dir` starting after `idx`.
+#[inline]
+pub const fn ray_mask(idx: usize, dir: Dir) -> u32 {
+    RAY_MASK[idx][dir as usize]
+}
+
+/// Returns the 0-based next square index (`0..=31`) in direction `dir`, or `255` if off-board.
+#[inline]
+pub const fn step_idx(idx: usize, dir: usize) -> u8 {
+    STEP_IDX[idx][dir]
+}
+
+/// Returns the 0-based index of the closest blocker along `dir` (`blockers` must be non-zero).
+/// `UpLeft (0)` and `UpRight (1)` strictly increase square index; `DownLeft (2)` and `DownRight (3)` strictly decrease it.
+#[inline]
+pub const fn first_blocker_idx(blockers: u32, dir: usize) -> usize {
+    debug_assert!(blockers != 0);
+    if dir < 2 {
+        blockers.trailing_zeros() as usize
+    } else {
+        31 - blockers.leading_zeros() as usize
+    }
+}
+
 impl fmt::Display for Square {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.0)
@@ -213,3 +322,54 @@ const RAY_TABLE: [[RayEntry; 4]; 32] = {
     }
     table
 };
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ray_mask_between_mask_and_first_blocker_match_ray_table() {
+        for idx in 0usize..32 {
+            let sq = Square::from_index(idx as u8).unwrap();
+            assert_eq!(
+                ALL_RAY_MASK[idx],
+                RAY_MASK[idx][0] | RAY_MASK[idx][1] | RAY_MASK[idx][2] | RAY_MASK[idx][3]
+            );
+            for dir in ALL_DIRS {
+                let d = dir as usize;
+                let ray = sq.ray(dir);
+                let mut expected_mask = 0u32;
+                for &cell in ray {
+                    expected_mask |= cell.bit();
+                }
+
+                // Verify step_idx matches Square::step
+                match sq.step(dir) {
+                    Some(next) => assert_eq!(step_idx(idx, d) as usize, next.index()),
+                    None => assert_eq!(step_idx(idx, d), 255),
+                }
+
+                // Verify BETWEEN_MASK along this ray
+                let mut acc = 0u32;
+                for &cell in ray {
+                    let b = cell.index();
+                    assert_eq!(BETWEEN_MASK[idx][b], acc);
+                    assert_eq!(BETWEEN_MASK[b][idx], acc);
+                    acc |= cell.bit();
+                }
+
+                // Verify first_blocker_idx for single and multi-blocker masks on this ray
+                if !ray.is_empty() {
+                    let first = ray[0].index();
+                    assert_eq!(first_blocker_idx(expected_mask, d), first);
+                    if ray.len() >= 2 {
+                        let second = ray[1].index();
+                        let mask_from_second = expected_mask & !(1u32 << first);
+                        assert_eq!(first_blocker_idx(mask_from_second, d), second);
+                    }
+                }
+            }
+            assert_eq!(BETWEEN_MASK[idx][idx], 0);
+        }
+    }
+}

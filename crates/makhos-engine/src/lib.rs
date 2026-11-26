@@ -1,13 +1,18 @@
 //! 32-bit bitboard Alpha-Beta AI and Multi-PV Analysis Engine for Thai Draughts (Makhos 8).
 
+pub mod book;
+pub mod endgame;
 pub mod eval;
 pub mod levels;
 pub mod search;
 pub mod tt;
 
+pub use book::{BookMoveEntry, OpeningBook};
 pub use eval::{evaluate, KING_VALUE, MAN_VALUE, MATE_THRESHOLD, WIN_SCORE};
-pub use levels::{choose_ai_move, level_profile, AiLevelProfile};
-pub use search::{AnalysisLine, AnalysisResult, Engine, SearchConfig, TablebaseProbe};
+pub use levels::{choose_ai_move, choose_ai_move_with_tb, level_profile, AiLevelProfile};
+pub use search::{
+    AnalysisLine, AnalysisResult, Engine, SearchConfig, SearchProgress, TablebaseProbe,
+};
 
 #[cfg(test)]
 mod tests {
@@ -29,6 +34,7 @@ mod tests {
                 max_nodes: Some(50_000),
                 multipv: 3,
                 history_hashes: Vec::new(),
+                ..Default::default()
             },
         );
         assert!(res.depth >= 4);
@@ -55,6 +61,7 @@ mod tests {
                 max_nodes: Some(20_000),
                 multipv: 1,
                 history_hashes: Vec::new(),
+                ..Default::default()
             },
         );
         assert_eq!(res.lines.len(), 1);
@@ -81,9 +88,63 @@ mod tests {
                 max_nodes: Some(20_000),
                 multipv: 2,
                 history_hashes: Vec::new(),
+                ..Default::default()
             },
         );
         assert_eq!(res.lines[0].best_move.long_notation(), "6x15x24");
+    }
+
+    #[test]
+    fn root_moves_filter_and_time_limit_work() {
+        let mut engine = Engine::new();
+        let start = Position::start();
+        let res = engine.analyze(
+            &start,
+            &SearchConfig {
+                max_depth: 6,
+                max_nodes: None,
+                max_time_ms: Some(150),
+                multipv: 3,
+                history_hashes: Vec::new(),
+                root_moves: Some(vec!["6-10".to_string(), "7-11".to_string()]),
+            },
+        );
+        assert_eq!(res.lines.len(), 2);
+        assert!(res.depth >= 1);
+        for line in &res.lines {
+            let ln = line.best_move.long_notation();
+            assert!(ln == "6-10" || ln == "7-11", "unexpected root move {ln}");
+        }
+    }
+
+    #[test]
+    fn analyze_with_progress_streams_depths_and_nodes() {
+        let mut engine = Engine::new();
+        let start = Position::start();
+        let mut seen_depths = Vec::new();
+        let mut max_nodes_seen = 0u64;
+        let mut cb = |p: SearchProgress<'_>| {
+            if p.lines.is_some() {
+                seen_depths.push(p.depth);
+            }
+            max_nodes_seen = max_nodes_seen.max(p.nodes);
+        };
+        let res = engine.analyze_with_progress(
+            &start,
+            &SearchConfig {
+                max_depth: 5,
+                max_nodes: Some(50_000),
+                multipv: 2,
+                history_hashes: Vec::new(),
+                ..Default::default()
+            },
+            None,
+            None,
+            Some(&mut cb),
+        );
+        assert_eq!(seen_depths, vec![1, 2, 3, 4, 5]);
+        assert!(max_nodes_seen > 0);
+        assert_eq!(res.depth, 5);
     }
 
     #[test]
@@ -96,6 +157,49 @@ mod tests {
                 .expect("AI must return a move");
             assert!(legal.contains(&mv));
             assert!(res.depth >= 1);
+            if level >= 2 {
+                assert_eq!(res.nodes, 0, "Level {level} should use memorized opening book");
+            }
         }
+    }
+
+    #[test]
+    fn opening_book_memorizes_continuations_and_transpositions() {
+        let mut engine = Engine::new();
+        let mut pos = Position::start();
+        let mut hashes = vec![pos.hash];
+
+        // Play 4 plies of memorized Standard opening — AI level 8 should answer from book with 0 nodes
+        for ply in 0..4 {
+            let (mv, res) = choose_ai_move(&mut engine, &pos, &hashes, 8, 100 + ply)
+                .expect("AI must return a book move");
+            assert_eq!(res.nodes, 0, "Expected opening book hit at ply {ply}");
+            pos = pos.apply_move(&mv);
+            hashes.push(pos.hash);
+        }
+    }
+
+    #[test]
+    fn upgraded_alpha_beta_pruning_reduces_nodes_dramatically_at_depth_8() {
+        let mut engine = Engine::new();
+        let start = Position::start();
+        let res = engine.analyze(
+            &start,
+            &SearchConfig {
+                max_depth: 8,
+                max_nodes: Some(500_000),
+                multipv: 1,
+                history_hashes: Vec::new(),
+                ..Default::default()
+            },
+        );
+        assert_eq!(res.depth, 8);
+        assert_eq!(res.lines.len(), 1);
+        // Baseline basic alpha-beta needed ~90,000 nodes at depth 8; PVS + Aspiration + LMR + Killers/History cuts this massively
+        assert!(
+            res.nodes < 45_000,
+            "Expected upgraded alpha-beta pruning to search < 45,000 nodes at depth 8, got {}",
+            res.nodes
+        );
     }
 }

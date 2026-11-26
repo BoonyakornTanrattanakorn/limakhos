@@ -1,0 +1,276 @@
+/* Lichess / Lidraughts board themes, highlights, eval bar, and piece styling */
+
+:root,
+[data-board-theme="brown"] {
+  --sq-light: #f0d9b5;
+  --sq-dark: #b58863;
+  --sq-dark-diag: #a87b56;
+  --sq-coord-on-dark: rgba(240, 217, 181, 0.9);
+  --sq-last: rgba(155, 199, 0, 0.41);
+  --sq-selected: rgba(20, 85, 30, 0.5);
+  --sq-move-dot: rgba(20, 85, 30, 0.5);
+  --sq-move-hover: rgba(20, 85, 30, 0.3);
+}
+
+[data-board-theme="blue"] {
+  --sq-light: #dee3e6;
+  --sq-dark: #8ca2ad;
+  --sq-dark-diag: #7d95a1;
+  --sq-coord-on-dark: rgba(235, 241, 245, 0.92);
+}
+
+[data-board-theme="green"] {
+  --sq-light: #ffffdd;
+  --sq-dark: #86a666;
+  --sq-dark-diag: #789858;
+  --sq-coord-on-dark: rgba(255, 255, 224, 0.92);
+}
+
+[data-board-theme="walnut"] {
+  --sq-light: #d7b892;
+  --sq-dark: #7d5434;
+  --sq-dark-diag: #6f482a;
+  --sq-coord-on-dark: rgba(240, 220, 192, 0.88);
+}
+
+.board-stage {
+  display: grid;
+  grid-template-columns: 22px 1fr;
+  gap: 4px;
+  align-items: stretch;
+}
+
+.board-stage.no-eval {
+  grid-template-columns: 1fr;
+}
+
+.board-stage.no-eval .eval-bar {
+  display: none;
+}
+
+.eval-bar {
+  position: relative;
+  border-radius: 2px;
+  overflow: hidden;
+  border: none;
+  background: #403d39;
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-end;
+}
+
+.eval-bar::after {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 50%;
+  height: 2px;
+  transform: translateY(-50%);
+  background: rgba(213, 145, 32, 0.65);
+  pointer-events: none;
+  z-index: 2;
+}
+
+.eval-bar-fill {
+  width: 100%;
+  background: #ffffff;
+  box-shadow: inset 0 1px 0 #e6e6e6;
+  transition: height 260ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.eval-bar-label {
+  position: absolute;
+  left: 50%;
+  transform: translateX(-50%);
+  font-size: 10px;
+  font-weight: 700;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  line-height: 1;
+  letter-spacing: -0.02em;
+  pointer-events: none;
+  padding: 2px 0;
+  z-index: 3;
+  white-space: nowrap;
+}
+
+.eval-bar-label.is-top {
+  top: 4px;
+  color: #fff;
+}
+
+.eval-bar-label.is-bottom {
+  bottom: 4px;
+  color: #222;
+}
+
+.makhos-board-shell {
+  width: 100%;
+  aspect-ratio: 1 / 1;
+  user-select: none;
+  touch-action: none;
+}
+
+.makhos-board {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  border-radius: 2px;
+  overflow: hidden;
+  border: none;
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.45);
+}
+
+.makhos-grid {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  grid-template-columns: repeat(8, 1fr);
+  grid-template-rows: repeat(8, 1fr);
+}
+
+.makhos-square {
+  position: relative;
+  width: 100%;
+  height: 100%;
+}
+
+.makhos-square.is-light {
+  background: var(--sq-light);
+}
+
+.makhos-square.is-dark {
+  background: var(--sq-dark);
+}
+
+/* Understated Thai 4–29 main diagonal tint & corner pip without clashing */
+.makhos-square.is-dark.is-main-diag {
+  background-color: var(--sq-dark-diag);
+  background-image: radial-gradient(
+    circle at calc(100% - 5px) calc(100% - 5px),
+    rgba(245, 205, 125, 0.38) 0 1.75px,
+    transparent 2px
+  );
+  box-shadow: inset 0 0 0 1px rgba(240, 200, 120, 0.2);
+}
+
+.makhos-square.is-last-move::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: var(--sq-last);
+  pointer-events: none;
+  z-index: 1;
+}
+
+.makhos-square.is-selected::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: var(--sq-selected);
+  pointer-events: none;
+  z-index: 1;
+}
+
+.makhos-square.has-mandatory-capture {
+  box-shadow: inset 0 0 0 3px rgba(213, 145, 32, 0.85);
+}
+
+.makhos-board.is-interactive .makhos-square.is-movable-square,
+.makhos-board.is-interactive .makhos-square.is-legal-dest {
+  cursor: pointer;
+}
+
+.makhos-square.is-legal-dest:hover::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: var(--sq-move-hover);
+  pointer-events: none;
+  z-index: 2;
+}
+
+.sq-num {
+  position: absolute;
+  top: 3px;
+  left: 4px;
+  font-size: clamp(9px, 1.05vw, 11.5px);
+  font-weight: 700;
+  color: var(--sq-coord-on-dark);
+  line-height: 1;
+  pointer-events: none;
+  z-index: 2;
+}
+
+.move-dot {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  border-radius: 50%;
+  pointer-events: none;
+  z-index: 4;
+}
+
+.move-dot.is-final {
+  width: 26%;
+  height: 26%;
+  background: var(--sq-move-dot);
+}
+
+.move-dot.is-step {
+  width: 24%;
+  height: 24%;
+  background: #e68f00;
+  border: 2px solid #ffffff;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.35);
+}
+
+.makhos-pieces {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  z-index: 3;
+}
+
+.makhos-piece {
+  position: absolute;
+  width: 12.5%;
+  height: 12.5%;
+  /* 4% of the square cell (0.5% of the 8x8 board container) */
+  padding: 0.5%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: left 135ms ease-out, top 135ms ease-out;
+}
+
+.makhos-piece.is-movable {
+  pointer-events: none;
+}
+
+.makhos-piece .piece-svg {
+  width: 100%;
+  height: 100%;
+  display: block;
+  filter: drop-shadow(0 2px 3px rgba(0, 0, 0, 0.38));
+}
+
+.makhos-piece.is-dragging {
+  transition: none;
+  z-index: 10;
+  transform: scale(1.1);
+}
+
+.makhos-piece.is-dragging .piece-svg {
+  filter: drop-shadow(0 6px 10px rgba(0, 0, 0, 0.5));
+}
+
+.makhos-arrows {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+  z-index: 5;
+}

@@ -1,0 +1,11 @@
+[package]
+name = "makhos-tb"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Retrograde WDL/DTZ endgame tablebase generator and prober calibrated to the TCA 2025 32-ply draw rule"
+
+[dependencies]
+makhos-core = { path = "../makhos-core" }
+makhos-engine = { path = "../makhos-engine" }
+serde = { workspace = true }

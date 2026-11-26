@@ -6,15 +6,27 @@ on:
   pull_request:
 
 jobs:
-  rust:
-    name: Rust Tests & WASM Build
+  rust-and-web:
+    name: Rust, WASM & Frontend Build/Tests
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-unknown-unknown
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
       - name: Run Rust workspace tests
         run: cargo test --workspace
-      - name: Build release WASM binary
-        run: cargo build -p makhos-wasm --target wasm32-unknown-unknown --release
+      - name: Install web dependencies
+        working-directory: web
+        run: npm ci
+      - name: Build WASM + Vite production bundle
+        working-directory: web
+        run: npm run build
+      - name: Run frontend tests
+        working-directory: web
+        run: npm test

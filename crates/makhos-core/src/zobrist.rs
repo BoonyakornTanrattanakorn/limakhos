@@ -45,6 +45,11 @@ pub const fn piece_key(color: Color, kind: PieceKind, sq: Square) -> u64 {
     PIECE_KEYS[piece_slot(color, kind)][sq.index()]
 }
 
+#[inline]
+pub const fn piece_key_idx(color: Color, kind: PieceKind, sq_idx: usize) -> u64 {
+    PIECE_KEYS[piece_slot(color, kind)][sq_idx]
+}
+
 pub fn compute_hash(
     light_men: u32,
     dark_men: u32,

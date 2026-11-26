@@ -1,0 +1,208 @@
+export type PuzzleTheme =
+  | "sacrifice"
+  | "multi_jump"
+  | "king_reversal"
+  | "king_halt"
+  | "no_majority"
+  | "promotion_trap"
+  | "stalemate_trap";
+
+export interface KonMakhosPuzzle {
+  id: string;
+  rating: number;
+  theme: PuzzleTheme;
+  themeTh: string;
+  themeEn: string;
+  titleTh: string;
+  titleEn: string;
+  hintTh: string;
+  hintEn: string;
+  fen: string;
+  /** Alternating moves `[player1, opponent1, player2, ...]` in TCA notation. */
+  solution: string[];
+}
+
+export const KON_MAKHOS_PUZZLES: KonMakhosPuzzle[] = [
+  {
+    id: "km-01",
+    rating: 1200,
+    theme: "sacrifice",
+    themeTh: "ต่อเสียสละเข้าฮอส",
+    themeEn: "Sacrifice & Sweep",
+    titleTh: "เสียหนึ่งกินสามเข้าฮอส 31",
+    titleEn: "Give One, Sweep Three to King",
+    hintTh: "ส่งเบี้ย 10 ไปล่อให้ฝ่ายสีเข้มกินบนตา 10 แล้วใช้เบี้ย 6 กวาด 3 ตัวรวดเข้าฮอส",
+    hintEn: "Sacrifice 10-15 so Dark must jump 19x10, opening a 3-piece sweep from square 6 to 31.",
+    fen: "W:W1,6,10,11:B18,19,26",
+    solution: ["10-15", "19x10", "6x15x22x31"],
+  },
+  {
+    id: "km-02",
+    rating: 1450,
+    theme: "multi_jump",
+    themeTh: "กินหลายจังหวะ",
+    themeEn: "Multi-Jump Combo",
+    titleTh: "กลหมากสวนกลับ 3 จังหวะ (27x2)",
+    titleEn: "Counter-Combination Triple Jump",
+    hintTh: "สละเบี้ย 31-27 บังคับฮอส 30 กิน แล้วใช้ 27 กินสวน 3 ตัวเข้าฮอสตา 2",
+    hintEn: "Sacrifice 31-27 to lure the Dark-back-rank Light King onto 23, then sweep 27x18x11x2.",
+    fen: "B:W1,3,4,6,7,10,15,K30:B12,26,28,29,31,32",
+    solution: ["31-27", "30x23", "27x18x11x2"],
+  },
+  {
+    id: "km-03",
+    rating: 1350,
+    theme: "king_reversal",
+    themeTh: "ฮอสหักศอก 180°",
+    themeEn: "180° King Reversal",
+    titleTh: "หยิบหมากออกทันทีแล้วหักศอกกลับกิน 3 ตัว",
+    titleEn: "Immediate Removal 180° Reversal",
+    hintTh: "เลือกกิน 11 ก่อน (15x8) แล้วหักศอก 180° มากิน 18 จอด 22 เพื่อต่อกิน 26 ถึง 31!",
+    hintEn: "Jump 11 first (15x8), clearing 11 immediately so your King reverses 180° over 18 to 22 and sweeps 26 to 31.",
+    fen: "W:WK15:B11,18,26",
+    solution: ["15x8x22x31"],
+  },
+  {
+    id: "km-04",
+    rating: 1320,
+    theme: "king_halt",
+    themeTh: "ฮอสหยุดหลังตัวกิน",
+    themeEn: "King Halt Capture",
+    titleTh: "จอดหยุดตา 22 ต่อสายกิน 31",
+    titleEn: "King Halt Alignment on Square 22",
+    hintTh: "ใช้ฮอสตา 4 บินมากิน 18 แล้วจอดหยุดที่ 22 เพื่อหักมุมกิน 26 ต่อทันที",
+    hintEn: "Only the King on 4 lands on square 22 (King Halt) to immediately continue over 26 onto 31.",
+    fen: "W:WK4,K23:BK29,18,26",
+    solution: ["4x22x31"],
+  },
+  {
+    id: "km-05",
+    rating: 1150,
+    theme: "no_majority",
+    themeTh: "เลือกสายกิน (ไม่บังคับกินมาก)",
+    themeEn: "No-Majority Capture Choice",
+    titleTh: "เลือกกินสองต่อแทนการกินหนึ่ง",
+    titleEn: "Choose the Winning Two-Piece Line",
+    hintTh: "กติกาหมากฮอสไทยไม่บังคับกินมากที่สุด ต้องเลือกสาย 6x15x24 ด้วยตัวเอง",
+    hintEn: "TCA 2025 has no majority rule—both 6x13 and 6x15x24 are legal. Take the two-piece capture!",
+    fen: "W:W2,6:B9,10,19",
+    solution: ["6x15x24"],
+  },
+  {
+    id: "km-06",
+    rating: 1380,
+    theme: "promotion_trap",
+    themeTh: "กับดักเข้าฮอส",
+    themeEn: "Promotion Trap",
+    titleTh: "ขึ้นฮอส 32 ตัดทางหนี",
+    titleEn: "Crown on 32 to Trap the King",
+    hintTh: "เดิน 27-32 เพื่อเข้าฮอสและล็อกฮอสสีเข้มบนตา 25 ให้ไร้ทางหนี",
+    hintEn: "Promote 27-32 immediately to dominate the flank and trap Dark's King.",
+    fen: "W:W2,10,27:BK25",
+    solution: ["27-32"],
+  },
+  {
+    id: "km-07",
+    rating: 1420,
+    theme: "promotion_trap",
+    themeTh: "เข้าฮอสหยุดตาเดิน",
+    themeEn: "Promotion Ends Turn",
+    titleTh: "รู้จังหวะหยุดเมื่อขึ้นฮอส",
+    titleEn: "Breakthrough via 13-17-22-29",
+    hintTh: "ต่อเบี้ย 17-22 ให้ 26x17 แล้วใช้ 13 กวาดเข้าฮอส 29",
+    hintEn: "Push 17-22 so Dark's 26 must jump 26x17 (18 blocks 25), letting 13 sweep 13x22x29.",
+    fen: "W:W13,17,18:B25,26",
+    solution: ["17-22", "26x17", "13x22x29"],
+  },
+  {
+    id: "km-08",
+    rating: 1280,
+    theme: "stalemate_trap",
+    themeTh: "บีบอับตาเดิน (Stalemate)",
+    themeEn: "Stalemate Trap",
+    titleTh: "ปิดมุม 4 ให้ฝ่ายสีเข้มไม่มีตาเดิน",
+    titleEn: "Seal Corner 4 for Instant Stalemate",
+    hintTh: "วางฮอสขวางทางออกเดียวจากตา 4 เพื่อบีบให้ฝ่ายสีเข้มอับตาเดิน (แพ้ทันที)",
+    hintEn: "In Makhos 8, stalemate is a win! Move your King from 3 to 8 to seal Dark's only escape from corner 4.",
+    fen: "W:WK3,K11:BK4",
+    solution: ["3-8"],
+  },
+  {
+    id: "km-09",
+    rating: 1520,
+    theme: "king_halt",
+    themeTh: "ฮอสหยุดหลังตัวกิน",
+    themeEn: "King Halt Sweep",
+    titleTh: "ล่อลงเส้น 32-5 แล้วฮอสหยุดกวาด 3 ตัว",
+    titleEn: "Lure onto 32–5 for a King Halt Sweep",
+    hintTh: "สละเบี้ย 17-22 บังคับ 25x18 แล้วฮอส 32 บินกิน 18 จอดหยุดตา 14 หักมุมกวาด 10 และ 11 รวดเดียว!",
+    hintEn: "Sacrifice 17-22 to force 25x18 onto the 32–5 diagonal, then sweep 32x14x7x16 via King Halt!",
+    fen: "W:W17,K32:B10,11,25,30",
+    solution: ["17-22", "25x18", "32x14x7x16"],
+  },
+  {
+    id: "km-10",
+    rating: 1580,
+    theme: "sacrifice",
+    themeTh: "ต่อเสียสละ",
+    themeEn: "Decoy Sacrifice",
+    titleTh: "ล่อฮอส 29 ออกจากเส้นป้องกัน",
+    titleEn: "Deflecting the Back-Rank King",
+    hintTh: "สละฮอส 14-18 ล่อฮอส 29 มากินที่ 15 แล้วใช้ฮอสตา 1 บินกินสวน 1x19 ปิดเกม!",
+    hintEn: "Sacrifice 14-18 to lure Dark's King onto 15 (29x15), then counter-capture 1x19 for a forced win!",
+    fen: "W:WK1,4,K14:B13,K29:H22",
+    solution: ["14-18", "29x15", "1x19"],
+  },
+  {
+    id: "km-11",
+    rating: 1480,
+    theme: "multi_jump",
+    themeTh: "กินหลายจังหวะ",
+    themeEn: "Wing Clearance Combo",
+    titleTh: "เจาะปีกซ้ายด้วย 24-20",
+    titleEn: "Left-Wing Tactical Breakthrough",
+    hintTh: "ฝ่ายสีเข้มแทง 24-20 บีบให้ 17-22 แล้วกินสวน 26x17 ได้เปรียบขาดลอย",
+    hintEn: "Dark thrusts 24-20 to gain tempo and crush Light's center.",
+    fen: "B:W8,9,10,11,14,17:B18,19,21,23,24,26",
+    solution: ["24-20"],
+  },
+  {
+    id: "km-12",
+    rating: 1250,
+    theme: "king_reversal",
+    themeTh: "ฮอสหักศอก 180°",
+    themeEn: "180° King Reversal",
+    titleTh: "หักศอก 180° จากมุม 4 เก็บ 3 ตัวรวด",
+    titleEn: "Corner-4 180° Reversal Sweep",
+    hintTh: "กิน 8 ลงมุม 4 ก่อน แล้วหักศอก 180° บินข้ามกระดานกิน 18 และ 26 ต่อเนื่องถึง 31!",
+    hintEn: "Jump 8 into corner 4 first (15x4), then reverse 180° across the main diagonal to sweep 18 and 26!",
+    fen: "W:WK15:B8,18,26",
+    solution: ["15x4x22x31"],
+  },
+  {
+    id: "km-13",
+    rating: 1300,
+    theme: "stalemate_trap",
+    themeTh: "บีบอับตาเดิน (Stalemate)",
+    themeEn: "Stalemate Trap",
+    titleTh: "ล็อกเบี้ยริมกระดานไม่ให้ขยับ",
+    titleEn: "Edge-Man Stalemate",
+    hintTh: "ฝ่ายสีเข้มเดิน 21-17 (มีฮอส 22 คอยหนุนหลัง) บีบให้เบี้ย 13 ขยับไม่ได้และกินไม่ได้ (อับตาเดิน = แพ้ทันที)",
+    hintEn: "Slide your King 21-17 (backed by K22 so 13x22 is blocked) to freeze Light's Man on 13.",
+    fen: "B:W13:BK22,K21",
+    solution: ["21-17"],
+  },
+  {
+    id: "km-14",
+    rating: 1620,
+    theme: "no_majority",
+    themeTh: "เลือกสายกิน (ไม่บังคับกินมาก)",
+    themeEn: "Optimal Capture Selection",
+    titleTh: "สายกินสั้นที่ให้ตำแหน่งชนะเด็ดขาด",
+    titleEn: "Tactical Capture Choice on the Main Diagonal",
+    hintTh: "เลือกสายกินที่ได้เปรียบตัวหมากหรือได้เข้าฮอส อย่าหลงสายกินที่โดนกินคืน",
+    hintEn: "Compare both legal captures carefully: 10x19x26 gets recaptured? Choose 10x17!",
+    fen: "W:W10:B14,15,23,30",
+    solution: ["10x17"],
+  },
+];

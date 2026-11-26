@@ -7,12 +7,72 @@ use makhos_core::{
     from_fen, from_pdn, resolve_move_notation, to_fen, to_pdn, Color, DrawReason, GameOutcome,
     GameState, Move, PieceKind, Position, Square, WinReason,
 };
-use makhos_engine::{choose_ai_move, AnalysisResult, Engine, SearchConfig};
+#[cfg(target_arch = "wasm32")]
+use makhos_engine::AnalysisLine;
+use makhos_engine::{
+    choose_ai_move_with_tb, AnalysisResult, Engine, SearchConfig, SearchProgress, TablebaseProbe,
+};
+use makhos_tb::LazyTablebase;
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 
 thread_local! {
     static ENGINE: RefCell<Engine> = RefCell::new(Engine::new());
+    static LAZY_TB: LazyTablebase = LazyTablebase::embedded();
+}
+
+#[cfg(target_arch = "wasm32")]
+#[link(wasm_import_module = "env")]
+extern "C" {
+    fn host_now_ms() -> f64;
+    fn host_on_progress(ptr: *const u8, len: usize);
+}
+
+#[cfg(target_arch = "wasm32")]
+#[derive(Serialize)]
+struct WasmProgressPayload<'a> {
+    ok: &'static str,
+    depth: u8,
+    nodes: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    lines: Option<&'a [AnalysisLine]>,
+}
+
+fn emit_progress(progress: SearchProgress<'_>) {
+    #[cfg(target_arch = "wasm32")]
+    {
+        let payload = WasmProgressPayload {
+            ok: "progress",
+            depth: progress.depth,
+            nodes: progress.nodes,
+            lines: progress.lines,
+        };
+        if let Ok(json) = serde_json::to_string(&payload) {
+            let bytes = json.as_bytes();
+            unsafe {
+                host_on_progress(bytes.as_ptr(), bytes.len());
+            }
+        }
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = progress;
+    }
+}
+
+fn current_time_ms() -> f64 {
+    #[cfg(target_arch = "wasm32")]
+    {
+        unsafe { host_now_ms() }
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs_f64() * 1000.0)
+            .unwrap_or(0.0)
+    }
 }
 
 #[derive(Deserialize)]
@@ -35,10 +95,13 @@ pub enum WasmRequest {
         #[serde(default = "default_depth")]
         max_depth: u8,
         max_nodes: Option<u64>,
+        max_time_ms: Option<u64>,
         #[serde(default = "default_multipv")]
         multipv: usize,
         #[serde(default)]
         history_hashes: Vec<String>,
+        #[serde(default)]
+        root_moves: Option<Vec<String>>,
     },
     AiMove {
         fen: String,
@@ -283,21 +346,50 @@ fn dispatch(req: WasmRequest) -> WasmResponse {
             fen,
             max_depth,
             max_nodes,
+            max_time_ms,
             multipv,
             history_hashes,
+            root_moves,
         } => {
             let hashes = parse_hashes(&history_hashes);
             let pos = match from_fen(&fen) {
                 Ok(p) => p,
                 Err(e) => return WasmResponse::Error { message: e },
             };
+            let resolved_max_nodes = match max_nodes {
+                Some(0) => None,
+                Some(n) => Some(n),
+                None => {
+                    if max_time_ms.is_some() {
+                        None
+                    } else {
+                        Some(350_000)
+                    }
+                }
+            };
             let cfg = SearchConfig {
                 max_depth,
-                max_nodes: max_nodes.or(Some(350_000)),
+                max_nodes: resolved_max_nodes,
+                max_time_ms,
                 multipv,
                 history_hashes: hashes,
+                root_moves,
             };
-            let result = ENGINE.with(|eng| eng.borrow_mut().analyze(&pos, &cfg));
+            let clock = current_time_ms;
+            let mut progress_cb = |progress: SearchProgress<'_>| {
+                emit_progress(progress);
+            };
+            let result = ENGINE.with(|eng| {
+                LAZY_TB.with(|tb| {
+                    eng.borrow_mut().analyze_with_progress(
+                        &pos,
+                        &cfg,
+                        Some(tb as &dyn TablebaseProbe),
+                        Some(&clock),
+                        Some(&mut progress_cb),
+                    )
+                })
+            });
             WasmResponse::Analysis(result)
         }
 
@@ -314,7 +406,16 @@ fn dispatch(req: WasmRequest) -> WasmResponse {
             };
             let legal = pos.legal_moves();
             let result = ENGINE.with(|eng| {
-                choose_ai_move(&mut eng.borrow_mut(), &pos, &hashes, level, seed)
+                LAZY_TB.with(|tb| {
+                    choose_ai_move_with_tb(
+                        &mut eng.borrow_mut(),
+                        &pos,
+                        &hashes,
+                        level,
+                        seed,
+                        Some(tb as &dyn TablebaseProbe),
+                    )
+                })
             });
             match result {
                 Some((mv, analysis)) => WasmResponse::AiMove {
