@@ -620,7 +620,7 @@ impl<'a, 'p> SearchContext<'a, 'p> {
         self.update_history_gravity(s, mv.from, mv.to, bonus);
         for &(from, to, _) in quiets_tried {
             if from != mv.from || to != mv.to {
-                self.update_history_gravity(s, from, to, -bonus / 2);
+                self.update_history_gravity(s, from, to, -(bonus * 3) / 4);
             }
         }
         let cont_bonus = (depth as i32) * (depth as i32) * 4;
@@ -629,7 +629,7 @@ impl<'a, 'p> SearchContext<'a, 'p> {
             update_cont_gravity(&mut row[(mv_piece_to & 63) as usize], cont_bonus);
             for &(from, to, pt) in quiets_tried {
                 if from != mv.from || to != mv.to {
-                    update_cont_gravity(&mut row[(pt & 63) as usize], -cont_bonus / 2);
+                    update_cont_gravity(&mut row[(pt & 63) as usize], -(cont_bonus * 3) / 4);
                 }
             }
         }
@@ -638,7 +638,7 @@ impl<'a, 'p> SearchContext<'a, 'p> {
             update_cont_gravity(&mut row[(mv_piece_to & 63) as usize], cont_bonus);
             for &(from, to, pt) in quiets_tried {
                 if from != mv.from || to != mv.to {
-                    update_cont_gravity(&mut row[(pt & 63) as usize], -cont_bonus / 2);
+                    update_cont_gravity(&mut row[(pt & 63) as usize], -(cont_bonus * 3) / 4);
                 }
             }
         }
@@ -725,7 +725,7 @@ fn search_root_aspiration(
     if depth >= 4 && excluded.is_empty() {
         if let Some(prev) = prev_score {
             if prev.abs() < MATE_THRESHOLD - 500 {
-                let mut delta = 22i32;
+                let mut delta = 14i32;
                 let mut alpha = (prev - delta).max(-INF);
                 let mut beta = (prev + delta).min(INF);
 
@@ -744,20 +744,21 @@ fn search_root_aspiration(
                         return Some((score, mv));
                     }
                     if score <= alpha && alpha > -INF {
-                        delta = (delta * 2).min(4_000);
+                        beta = (alpha + beta) / 2;
+                        delta = (delta + delta / 2 + 12).min(4_000);
                         alpha = if delta >= 4_000 {
                             -INF
                         } else {
-                            (alpha - delta).max(-INF)
+                            (score - delta).max(-INF)
                         };
                         continue;
                     }
                     if score >= beta && beta < INF {
-                        delta = (delta * 2).min(4_000);
+                        delta = (delta + delta / 2 + 12).min(4_000);
                         beta = if delta >= 4_000 {
                             INF
                         } else {
-                            (beta + delta).min(INF)
+                            (score + delta).min(INF)
                         };
                         continue;
                     }
@@ -1101,11 +1102,11 @@ fn negamax(
     if !is_pv && !has_cap && !near_draw_horizon && piece_count >= 4 {
         if let Some(ev) = refined_eval {
             // 1. Reverse Futility Pruning (Static Null Move Pruning)
-            if depth <= 6
+            if depth <= 7
                 && beta.abs() < MATE_THRESHOLD
                 && (piece_count >= 6 || has_own_king)
             {
-                let mut margin_per_ply = if improving { 75 } else { 105 };
+                let mut margin_per_ply = if improving { 68 } else { 96 };
                 if piece_count <= 5 {
                     margin_per_ply += 25;
                 }
@@ -1442,22 +1443,25 @@ fn negamax(
         &mut []
     };
 
-    let futility_margin = 90 + 95 * (depth as i32);
     let can_futility_prune = !is_pv
         && !is_capture_node
         && refined_eval.is_some()
-        && depth <= 5
         && alpha.abs() < MATE_THRESHOLD
         && (piece_count >= 5 || (piece_count >= 4 && has_own_king))
         && !near_draw_horizon;
 
     let lmp_limit = if !is_pv
         && !is_capture_node
-        && depth <= 5
+        && depth <= 6
         && (piece_count >= 6 || (piece_count >= 4 && has_own_king && rem_count >= 8))
         && alpha.abs() < MATE_THRESHOLD
     {
-        Some((if improving { 4 } else { 3 }) + (depth as usize) * (depth as usize))
+        let d = depth as usize;
+        Some(if improving {
+            4 + d * d
+        } else {
+            2 + (d * d * 2) / 3
+        })
     } else {
         None
     };
@@ -1498,6 +1502,44 @@ fn negamax(
             0
         };
 
+        let lmr_eligible = !is_tactical
+            && piece_count >= 4
+            && ((depth >= 3 && move_idx >= 1) || (!is_pv && depth >= 2 && move_idx >= 2));
+        let est_reduction = if lmr_eligible {
+            let d_idx = (depth as usize).min(63);
+            let m_idx = move_idx.min(63);
+            let mut r = ctx.lmr_table[d_idx][m_idx] as i32;
+            if tt_pv {
+                r -= 1;
+            }
+            if !improving {
+                r += 1;
+            }
+            if cut_node && !is_pv {
+                r += 1;
+            }
+            if is_killer {
+                r -= 1;
+            }
+            r -= (hist / 26_000).clamp(-2, 2);
+            if piece_count <= 5 && rem_count < 10 {
+                r -= 1;
+            }
+            if r > 0 {
+                let max_red = if depth == 2 {
+                    base_next_depth
+                } else {
+                    base_next_depth.saturating_sub(1)
+                };
+                (r as u8).min(max_red)
+            } else {
+                0
+            }
+        } else {
+            0
+        };
+        let lmr_depth = base_next_depth.saturating_sub(est_reduction);
+
         // Late Move Pruning (LMP), History Leaf Pruning & Futility Pruning on quiet non-killer moves
         if move_idx > 0 && !is_tactical && !is_killer {
             if let Some(limit) = lmp_limit {
@@ -1505,12 +1547,16 @@ fn negamax(
                     break;
                 }
             }
-            if !is_pv && depth <= 4 && piece_count >= 6 && hist < -14_000 * (depth as i32) {
+            if !is_pv
+                && piece_count >= 5
+                && lmr_depth <= 4
+                && hist < -10_000 * (lmr_depth as i32 + 1)
+            {
                 continue;
             }
-            if can_futility_prune {
+            if can_futility_prune && lmr_depth <= 5 {
                 if let Some(ev) = refined_eval {
-                    if ev + futility_margin <= alpha {
+                    if ev + (85 + 90 * (lmr_depth as i32)) <= alpha {
                         continue;
                     }
                 }
@@ -1543,40 +1589,11 @@ fn negamax(
             // Smooth Logarithmic Late Move Reductions (LMR) modulated by tt_pv, cut_node, improving, history & endgame safety
             let mut child_has_cap: Option<bool> = None;
             let mut reduction = 0u8;
-            let lmr_eligible = !is_tactical
-                && piece_count >= 4
-                && ((depth >= 3 && move_idx >= 1) || (!is_pv && depth >= 2 && move_idx >= 2));
-            if lmr_eligible {
+            if est_reduction > 0 {
                 let hc = next.has_capture();
                 child_has_cap = Some(hc);
                 if !hc {
-                    let d_idx = (depth as usize).min(63);
-                    let m_idx = move_idx.min(63);
-                    let mut r = ctx.lmr_table[d_idx][m_idx] as i32;
-                    if tt_pv {
-                        r -= 1;
-                    }
-                    if !improving {
-                        r += 1;
-                    }
-                    if cut_node && !is_pv {
-                        r += 1;
-                    }
-                    if is_killer {
-                        r -= 1;
-                    }
-                    r -= (hist / 26_000).clamp(-2, 2);
-                    if piece_count <= 5 && rem_count < 10 {
-                        r -= 1;
-                    }
-                    if r > 0 {
-                        let max_red = if depth == 2 {
-                            base_next_depth
-                        } else {
-                            base_next_depth.saturating_sub(1)
-                        };
-                        reduction = (r as u8).min(max_red);
-                    }
+                    reduction = est_reduction;
                 }
             }
 
