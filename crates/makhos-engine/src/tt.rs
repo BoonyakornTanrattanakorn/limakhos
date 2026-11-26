@@ -1,5 +1,7 @@
 use crate::eval::MATE_THRESHOLD;
 
+pub const EVAL_NONE: i16 = i16::MIN;
+
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
 #[repr(u8)]
 pub enum Bound {
@@ -9,82 +11,231 @@ pub enum Bound {
     Upper = 3,
 }
 
-#[derive(Copy, Clone, Debug)]
-pub struct TtEntry {
-    pub key: u64,
-    pub score: i32,
-    pub depth: u8,
-    pub bound: Bound,
-    pub best_from: u8,
-    pub best_to: u8,
+impl Bound {
+    #[inline]
+    fn from_bits(bits: u8) -> Self {
+        match bits & 0x03 {
+            1 => Bound::Exact,
+            2 => Bound::Lower,
+            3 => Bound::Upper,
+            _ => Bound::Empty,
+        }
+    }
 }
 
-impl Default for TtEntry {
+/// Compact 16-byte TT entry (4 entries fit cleanly in one 64-byte CPU cache line).
+#[derive(Copy, Clone, Debug)]
+#[repr(C)]
+struct RawTtEntry {
+    key: u64,
+    score: i16,
+    static_eval: i16,
+    depth: u8,
+    /// Low 2 bits = `Bound`, bit 2 = `tt_pv`, high 5 bits = generation (`1..31`).
+    meta: u8,
+    best_from: u8,
+    best_to: u8,
+}
+
+impl Default for RawTtEntry {
     fn default() -> Self {
         Self {
             key: 0,
             score: 0,
+            static_eval: EVAL_NONE,
             depth: 0,
-            bound: Bound::Empty,
+            meta: 0,
             best_from: 0,
             best_to: 0,
         }
     }
 }
 
+impl RawTtEntry {
+    #[inline]
+    fn bound(self) -> Bound {
+        Bound::from_bits(self.meta)
+    }
+
+    #[inline]
+    fn tt_pv(self) -> bool {
+        (self.meta & 0x04) != 0
+    }
+
+    #[inline]
+    fn generation(self) -> u8 {
+        self.meta >> 3
+    }
+}
+
+/// Public unpacked view returned on TT probe.
+#[derive(Copy, Clone, Debug)]
+pub struct TtEntry {
+    pub key: u64,
+    pub score: i32,
+    pub static_eval: Option<i32>,
+    pub depth: u8,
+    pub bound: Bound,
+    pub tt_pv: bool,
+    pub best_from: u8,
+    pub best_to: u8,
+}
+
+/// 4-way set-associative cache-line bucket (64 bytes aligned = 1 cache line per probe).
+#[derive(Copy, Clone, Default, Debug)]
+#[repr(C, align(64))]
+struct TtBucket {
+    slots: [RawTtEntry; 4],
+}
+
 pub struct TranspositionTable {
-    entries: Vec<TtEntry>,
+    buckets: Vec<TtBucket>,
     mask: usize,
+    generation: u8,
 }
 
 impl TranspositionTable {
-    /// Allocate a power-of-two transposition table (default ~65,536 entries ≈ 1.5 MB).
-    pub fn new(power_of_two_size: usize) -> Self {
-        let size = power_of_two_size.next_power_of_two().max(1024);
+    /// Allocate a power-of-two transposition table organized as 4-way 64-byte cache-line buckets.
+    /// Default `1 << 18` = 262,144 entries (65,536 buckets × 64 bytes = 4 MB).
+    pub fn new(power_of_two_entries: usize) -> Self {
+        let total = power_of_two_entries.next_power_of_two().max(4096);
+        let bucket_count = (total / 4).max(1024);
         Self {
-            entries: vec![TtEntry::default(); size],
-            mask: size - 1,
+            buckets: vec![TtBucket::default(); bucket_count],
+            mask: bucket_count - 1,
+            generation: 1,
         }
     }
 
     pub fn clear(&mut self) {
-        self.entries.fill(TtEntry::default());
+        self.buckets.fill(TtBucket::default());
+        self.generation = 1;
     }
 
+    /// Advance the 5-bit search generation counter so stale entries are replaced preferentially.
     #[inline]
-    pub fn probe(&self, key: u64) -> Option<TtEntry> {
-        let entry = self.entries[(key as usize) & self.mask];
-        if entry.bound != Bound::Empty && entry.key == key {
-            Some(entry)
-        } else {
-            None
+    pub fn new_search(&mut self) {
+        self.generation = (self.generation + 1) & 0x1F;
+        if self.generation == 0 {
+            self.generation = 1;
         }
     }
 
     #[inline]
+    pub fn prefetch(&self, key: u64) {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            let ptr = self.buckets.as_ptr().add((key as usize) & self.mask) as *const i8;
+            std::arch::x86_64::_mm_prefetch(ptr, std::arch::x86_64::_MM_HINT_T0);
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            let _ = key;
+        }
+    }
+
+    #[inline]
+    pub fn probe(&self, key: u64) -> Option<TtEntry> {
+        let bucket = &self.buckets[(key as usize) & self.mask];
+        for slot in bucket.slots {
+            if slot.meta != 0 && slot.key == key {
+                return Some(TtEntry {
+                    key: slot.key,
+                    score: slot.score as i32,
+                    static_eval: if slot.static_eval == EVAL_NONE {
+                        None
+                    } else {
+                        Some(slot.static_eval as i32)
+                    },
+                    depth: slot.depth,
+                    bound: slot.bound(),
+                    tt_pv: slot.tt_pv(),
+                    best_from: slot.best_from,
+                    best_to: slot.best_to,
+                });
+            }
+        }
+        None
+    }
+
+    #[inline]
+    #[allow(clippy::too_many_arguments)]
     pub fn store(
         &mut self,
         key: u64,
         depth: u8,
         bound: Bound,
+        tt_pv: bool,
         score: i32,
+        static_eval: Option<i32>,
         ply: i32,
         best_from: u8,
         best_to: u8,
     ) {
         let idx = (key as usize) & self.mask;
-        let existing = self.entries[idx];
-        if existing.bound == Bound::Empty || existing.key != key || depth >= existing.depth {
-            let stored_score = score_to_tt(score, ply);
-            self.entries[idx] = TtEntry {
-                key,
-                score: stored_score,
-                depth,
-                bound,
-                best_from,
-                best_to,
-            };
+        let gen = self.generation;
+        let stored_score = score_to_tt(score, ply).clamp(-32_000, 32_000) as i16;
+        let stored_eval = match static_eval {
+            Some(ev) => ev.clamp(-31_000, 31_000) as i16,
+            None => EVAL_NONE,
+        };
+        let meta = (gen << 3) | (u8::from(tt_pv) << 2) | (bound as u8);
+
+        let bucket = &mut self.buckets[idx];
+        let mut replace_idx = 0usize;
+        let mut worst_priority = i32::MAX;
+
+        for i in 0..4 {
+            let slot = bucket.slots[i];
+            if slot.meta == 0 {
+                replace_idx = i;
+                break;
+            }
+            if slot.key == key {
+                let merged_tt_pv = slot.tt_pv() || tt_pv;
+                // Same position: always update if exact, deeper, or stale generation; preserve best move if none
+                if depth >= slot.depth || bound == Bound::Exact || slot.generation() != gen {
+                    let final_from = if best_from != 0 { best_from } else { slot.best_from };
+                    let final_to = if best_to != 0 { best_to } else { slot.best_to };
+                    let final_eval = if stored_eval != EVAL_NONE {
+                        stored_eval
+                    } else {
+                        slot.static_eval
+                    };
+                    let updated_meta = (gen << 3) | (u8::from(merged_tt_pv) << 2) | (bound as u8);
+                    bucket.slots[i] = RawTtEntry {
+                        key,
+                        score: stored_score,
+                        static_eval: final_eval,
+                        depth,
+                        meta: updated_meta,
+                        best_from: final_from,
+                        best_to: final_to,
+                    };
+                } else if merged_tt_pv && !slot.tt_pv() {
+                    bucket.slots[i].meta |= 0x04;
+                }
+                return;
+            }
+            // Priority score: keep current-generation deep/exact entries, replace stale shallow entries first
+            let age_penalty = if slot.generation() == gen { 0 } else { -64 };
+            let exact_bonus = if slot.bound() == Bound::Exact { 4 } else { 0 };
+            let priority = (slot.depth as i32) * 2 + age_penalty + exact_bonus;
+            if priority < worst_priority {
+                worst_priority = priority;
+                replace_idx = i;
+            }
         }
+
+        bucket.slots[replace_idx] = RawTtEntry {
+            key,
+            score: stored_score,
+            static_eval: stored_eval,
+            depth,
+            meta,
+            best_from,
+            best_to,
+        };
     }
 }
 

@@ -9,4 +9,4 @@ pub mod probe;
 pub use format::{TablebaseSlice, TbEntry, Wdl, FORMAT_VERSION, MAGIC};
 pub use gen::{generate_all, generate_slice};
 pub use index::{SliceIndexer, SliceKey};
-pub use probe::{TablebaseSet, TbMoveEval, TbProbeDetails, TbResult};
+pub use probe::{LazyTablebase, TablebaseSet, TbMoveEval, TbProbeDetails, TbResult};

@@ -1,7 +1,7 @@
 use crate::moves::Move;
 use crate::square::{
-    Square, ALL_DIRS, DARK_BACK_RANK_MASK, DARK_FORWARD_DIRS, DARK_START_MASK,
-    LIGHT_BACK_RANK_MASK, LIGHT_FORWARD_DIRS, LIGHT_START_MASK,
+    first_blocker_idx, step_idx, Square, ALL_DIRS, DARK_BACK_RANK_MASK, DARK_FORWARD_DIRS,
+    DARK_START_MASK, LIGHT_BACK_RANK_MASK, LIGHT_FORWARD_DIRS, LIGHT_START_MASK, RAY_MASK,
 };
 use crate::zobrist;
 use serde::{Deserialize, Serialize};
@@ -51,7 +51,7 @@ pub struct Piece {
 }
 
 /// Complete 32-bit bitboard position for 8-piece Thai Draughts (Makhos 8).
-#[derive(Clone, Eq, PartialEq, Debug, Serialize, Deserialize)]
+#[derive(Copy, Clone, Eq, PartialEq, Debug, Serialize, Deserialize)]
 pub struct Position {
     pub light_men: u32,
     pub dark_men: u32,
@@ -203,57 +203,82 @@ impl Position {
         }
     }
 
-    /// Returns true if the side to move has any mandatory capture available.
-    pub fn has_capture(&self) -> bool {
+    /// Returns the exact bitmask of `side_to_move` Men that have at least one mandatory capture.
+    /// Executes in ~16 bitwise operations with zero loops or table lookups.
+    #[inline]
+    pub fn man_capturers(&self) -> u32 {
         let us = self.side_to_move;
+        let men = self.men_of(us);
+        if men == 0 {
+            return 0;
+        }
         let opp = self.pieces_of(us.opponent());
         let empty = !self.all_pieces();
-        let fwd = match us {
-            Color::Light => LIGHT_FORWARD_DIRS,
-            Color::Dark => DARK_FORWARD_DIRS,
-        };
-
-        let mut men = self.men_of(us);
-        while men != 0 {
-            let sq = Square::from_index(men.trailing_zeros() as u8).unwrap();
-            men &= men - 1;
-            for dir in fwd {
-                if let Some(mid) = sq.step(dir) {
-                    if (opp & mid.bit()) != 0 {
-                        if let Some(land) = mid.step(dir) {
-                            if (empty & land.bit()) != 0 {
-                                return true;
-                            }
-                        }
-                    }
-                }
+        match us {
+            Color::Light => {
+                // UpLeft (+5 then +4 from even rows; +4 then +5 from odd rows)
+                // UpRight (+4 then +3 from even rows; +3 then +4 from odd rows)
+                let emp4_opp = (empty >> 4) & opp;
+                let ul_even = (emp4_opp >> 5) & 0x0007_0707;
+                let ur_odd = (emp4_opp >> 3) & 0x00E0_E0E0;
+                let ul_odd = (((empty >> 5) & opp) >> 4) & 0x0070_7070;
+                let ur_even = (((empty >> 3) & opp) >> 4) & 0x000E_0E0E;
+                (ul_even | ul_odd | ur_even | ur_odd) & men
+            }
+            Color::Dark => {
+                // DownRight (-4 then -5 from even rows; -5 then -4 from odd rows)
+                // DownLeft (-3 then -4 from even rows; -4 then -3 from odd rows)
+                let emp4_opp = (empty << 4) & opp;
+                let dr_odd = (emp4_opp << 5) & 0xE0E0_E000;
+                let dl_even = (emp4_opp << 3) & 0x0707_0700;
+                let dr_even = (((empty << 5) & opp) << 4) & 0x0E0E_0E00;
+                let dl_odd = (((empty << 3) & opp) << 4) & 0x7070_7000;
+                (dr_even | dr_odd | dl_even | dl_odd) & men
             }
         }
+    }
 
+    /// Fast bitboard-parallel check for whether `side_to_move` has any mandatory Man capture.
+    /// Executes in ~16 bitwise operations with zero loops or table lookups.
+    #[inline]
+    pub fn has_man_capture(&self) -> bool {
+        self.man_capturers() != 0
+    }
+
+    /// Fast O(1)-per-direction check for whether `side_to_move` has any mandatory King capture.
+    #[inline]
+    pub fn has_king_capture(&self) -> bool {
+        let us = self.side_to_move;
         let mut kings = self.kings_of(us);
+        if kings == 0 {
+            return false;
+        }
+        let opp = self.pieces_of(us.opponent());
         let occupied = self.all_pieces();
         while kings != 0 {
-            let sq = Square::from_index(kings.trailing_zeros() as u8).unwrap();
+            let sq_idx = kings.trailing_zeros() as usize;
             kings &= kings - 1;
-            for dir in ALL_DIRS {
-                let ray = sq.ray(dir);
-                for (i, &cell) in ray.iter().enumerate() {
-                    let b = cell.bit();
-                    if (occupied & b) != 0 {
-                        if (opp & b) != 0 {
-                            if let Some(&land) = ray.get(i + 1) {
-                                if (occupied & land.bit()) == 0 {
-                                    return true;
-                                }
-                            }
+            let rays = &RAY_MASK[sq_idx];
+            for dir in 0..4 {
+                let blockers = rays[dir] & occupied;
+                if blockers != 0 {
+                    let b = first_blocker_idx(blockers, dir);
+                    if (opp & (1u32 << b)) != 0 {
+                        let land = step_idx(b, dir);
+                        if land < 32 && (occupied & (1u32 << land)) == 0 {
+                            return true;
                         }
-                        break;
                     }
                 }
             }
         }
-
         false
+    }
+
+    /// Returns true if the side to move has any mandatory capture available.
+    #[inline]
+    pub fn has_capture(&self) -> bool {
+        self.has_man_capture() || self.has_king_capture()
     }
 
     /// Generate all legal moves in the current position under TCA 2025 Makhos 8 rules.

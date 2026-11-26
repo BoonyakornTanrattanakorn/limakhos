@@ -59,6 +59,13 @@ export interface AnalysisResult {
   lines: AnalysisLine[];
 }
 
+export interface AnalysisProgress {
+  ok: "progress";
+  depth: number;
+  nodes: number;
+  lines?: AnalysisLine[];
+}
+
 export type WasmRequest =
   | { cmd: "inspect"; fen?: string; history_hashes?: string[] }
   | { cmd: "apply_move"; fen: string; move: string; history_hashes?: string[] }
@@ -67,8 +74,10 @@ export type WasmRequest =
       fen: string;
       max_depth?: number;
       max_nodes?: number;
+      max_time_ms?: number;
       multipv?: number;
       history_hashes?: string[];
+      root_moves?: string[];
     }
   | { cmd: "ai_move"; fen: string; level: number; seed?: number; history_hashes?: string[] }
   | {

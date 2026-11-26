@@ -159,6 +159,7 @@ fn mine_positions(
                 max_nodes: Some(180_000),
                 multipv: 2,
                 history_hashes: hashes.clone(),
+                ..Default::default()
             },
         );
         if res.lines.len() < 2 {

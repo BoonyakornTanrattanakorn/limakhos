@@ -1,6 +1,7 @@
 import "./styles/app.css";
+import "./styles/board.css";
 import { MakhosBoard, type BoardArrow } from "./board/MakhosBoard";
-import { MakhosEngineClient } from "./engine/client";
+import { AnalysisCancelledError, MakhosEngineClient } from "./engine/client";
 import type { AnalysisResult, Color, GameOutcome, MoveDto, PositionSnapshot } from "./engine/types";
 import { MESSAGES, type Locale } from "./i18n/messages";
 import {
@@ -16,6 +17,16 @@ import { FORMATIONS, OPENING_BOOK, matchOpeningHistory } from "./study/openings"
 import { PRACTICE_MODULES, type PracticeDrill, type PracticeModule } from "./study/practice";
 import { KON_MAKHOS_PUZZLES, type KonMakhosPuzzle } from "./study/puzzles";
 import { evalToLightPercent, formatClockMs, formatEvalLight } from "./ui/eval";
+import { ICONS } from "./ui/icons";
+import {
+  BOARD_THEMES,
+  applyThemeAttributes,
+  loadUiPrefs,
+  saveUiPrefs,
+  type BoardTheme,
+  type UiPrefs,
+  type UiTheme,
+} from "./ui/prefs";
 
 type PlayMode = "analysis" | "ai" | "local" | "online" | "puzzles" | "practice";
 
@@ -28,14 +39,50 @@ interface TimeControlOption {
 
 const TIME_CONTROLS: TimeControlOption[] = [
   { id: "unlimited", label: "∞", initialMs: 0, incrementMs: 0 },
-  { id: "12+5", label: "12+5 (Standard)", initialMs: 12 * 60_000, incrementMs: 5_000 },
-  { id: "5+3", label: "5+3 (Rapid)", initialMs: 5 * 60_000, incrementMs: 3_000 },
-  { id: "3+2", label: "3+2 (Blitz)", initialMs: 3 * 60_000, incrementMs: 2_000 },
+  { id: "12+5", label: "12+5", initialMs: 12 * 60_000, incrementMs: 5_000 },
+  { id: "5+3", label: "5+3", initialMs: 5 * 60_000, incrementMs: 3_000 },
+  { id: "3+2", label: "3+2", initialMs: 3 * 60_000, incrementMs: 2_000 },
 ];
 
 const LS_TOKEN_KEY = "limakhos_auth_token";
 const LS_GUEST_KEY = "limakhos_guest_name";
 const LS_STUDY_PROGRESS_KEY = "limakhos_study_progress_v1";
+const BLACK_FIRST_START_FEN = "B:W1,2,3,4,5,6,7,8:B25,26,27,28,29,30,31,32";
+
+/** Discrete time-limit steps for the analysis slider; 0 at the right end means unlimited (∞). */
+const ANALYSIS_TIME_STEPS_MS = [
+  250, 500, 1000, 1500, 2000, 3000, 5000, 8000, 12000, 20000, 30000, 60000, 0,
+];
+
+function formatAnalysisTime(ms: number): string {
+  if (ms <= 0) return "∞";
+  if (ms < 1000) return `${ms}ms`;
+  const secs = ms / 1000;
+  return Number.isInteger(secs) ? `${secs}s` : `${secs.toFixed(1)}s`;
+}
+
+function timeMsToSliderIndex(ms: number): number {
+  const exact = ANALYSIS_TIME_STEPS_MS.indexOf(ms);
+  if (exact !== -1) return exact;
+  if (ms <= 0) return ANALYSIS_TIME_STEPS_MS.length - 1;
+  let bestIdx = 0;
+  let bestDiff = Number.POSITIVE_INFINITY;
+  for (let i = 0; i < ANALYSIS_TIME_STEPS_MS.length; i++) {
+    const step = ANALYSIS_TIME_STEPS_MS[i];
+    if (step <= 0) continue;
+    const diff = Math.abs(step - ms);
+    if (diff < bestDiff) {
+      bestDiff = diff;
+      bestIdx = i;
+    }
+  }
+  return bestIdx;
+}
+
+function formatElapsedMs(ms: number): string {
+  if (ms < 1000) return `${ms} ms`;
+  return `${(ms / 1000).toFixed(1)} s`;
+}
 
 interface StudyProgress {
   puzzleRating: number;
@@ -78,17 +125,25 @@ class LimakhosApp {
   private online = new OnlineClient();
   private board!: MakhosBoard;
 
-  private locale: Locale = "th";
+  private prefs: UiPrefs = loadUiPrefs();
+  private locale: Locale = this.prefs.locale;
   private mode: PlayMode = "analysis";
   private humanColor: Color = "light";
   private aiLevel = 5;
   private timeControlId = "unlimited";
   private orientation: Color = "light";
-  private showNumbers = true;
-  private showMainDiagonal = true;
+  private showNumbers = this.prefs.showNumbers;
+  private showMainDiagonal = this.prefs.showMainDiagonal;
+
+  // UI-only view states
+  private settingsOpen = false;
+  private underboardTab: "opening" | "fen" = "opening";
+  private onlineSubTab: "lobby" | "leaderboard" | "recent" = "lobby";
 
   private analysisEnabled = true;
-  private analysisDepth = 8;
+  private analysisThreads = 1;
+  private analysisDepth = 10;
+  private analysisTimeMs = 1500;
   private analysisMultiPv = 3;
   private analysisSeq = 0;
   private analysisBusy = false;
@@ -140,6 +195,11 @@ class LimakhosApp {
 
   // DOM refs
   private root: HTMLElement;
+  private settingsWrapEl: HTMLElement | null = null;
+  private settingsPopoverEl: HTMLElement | null = null;
+  private settingsBtnEl: HTMLButtonElement | null = null;
+  private userChipEl: HTMLButtonElement | null = null;
+  private boardStageEl!: HTMLElement;
   private boardMount!: HTMLElement;
   private evalFill!: HTMLElement;
   private evalTopLabel!: HTMLElement;
@@ -147,23 +207,37 @@ class LimakhosApp {
   private topPlayerEl!: HTMLElement;
   private bottomPlayerEl!: HTMLElement;
   private statusEl!: HTMLElement;
-  private onlinePanelEl!: HTMLElement | null;
-  private studyPanelEl!: HTMLElement | null;
+  private onlinePanelEl: HTMLElement | null = null;
+  private studyPanelEl: HTMLElement | null = null;
   private analysisPanelEl!: HTMLElement;
-  private openingPanelEl!: HTMLElement | null;
+  private openingPanelEl: HTMLElement | null = null;
+  private fenPanelEl!: HTMLElement;
   private movesPanelEl!: HTMLElement;
   private ioTextarea!: HTMLTextAreaElement;
   private toastEl!: HTMLElement;
 
   constructor(root: HTMLElement) {
     this.root = root;
+    applyThemeAttributes(this.prefs);
+
     const urlRoom = new URLSearchParams(window.location.search).get("room")?.trim();
     if (urlRoom) {
       this.mode = "online";
       this.analysisEnabled = false;
+    } else if (this.prefs.blackFirst) {
+      this.orientation = "dark";
     }
 
     this.renderShell();
+
+    document.addEventListener("click", (ev) => {
+      if (!this.settingsOpen) return;
+      const target = ev.target;
+      if (target instanceof Node && this.settingsWrapEl?.contains(target)) return;
+      if (target instanceof Element && target.closest(".settings-wrap")) return;
+      this.settingsOpen = false;
+      this.syncSettingsPopover();
+    });
     window.addEventListener("keydown", (ev) => this.handleKeydown(ev));
 
     if (urlRoom) {
@@ -177,134 +251,361 @@ class LimakhosApp {
     return MESSAGES[this.locale];
   }
 
+  private updatePrefs(partial: Partial<UiPrefs>): void {
+    this.prefs = { ...this.prefs, ...partial };
+    this.locale = this.prefs.locale;
+    this.showNumbers = this.prefs.showNumbers;
+    this.showMainDiagonal = this.prefs.showMainDiagonal;
+    saveUiPrefs(this.prefs);
+    applyThemeAttributes(this.prefs);
+  }
+
   private async initOnlineFromUrl(roomId: string): Promise<void> {
     await this.startNewGame();
     await this.refreshOnlineLobby();
     this.joinOnlineRoom(roomId, "player");
   }
 
+  private modeTitle(mode: PlayMode): string {
+    const t = this.t();
+    switch (mode) {
+      case "analysis":
+        return t.modeAnalysis;
+      case "ai":
+        return t.modeAi;
+      case "local":
+        return t.modeLocal;
+      case "puzzles":
+        return t.modePuzzles;
+      case "practice":
+        return t.modePractice;
+      case "online":
+        return t.modeOnline;
+    }
+  }
+
+  private modeIcon(mode: PlayMode): string {
+    return ICONS[mode];
+  }
+
+  private shouldShowEvalBar(): boolean {
+    if (!this.analysisEnabled) return false;
+    if (this.mode === "puzzles") return false;
+    if (this.mode === "online" && this.onlineState?.status === "active") return false;
+    if (this.mode === "practice" && !this.practiceLiveEval) return false;
+    return true;
+  }
+
+  private switchMode(nextMode: PlayMode): void {
+    if (nextMode === this.mode) {
+      if (nextMode === "online") {
+        void this.refreshOnlineLobby();
+      }
+      return;
+    }
+    this.leaveOnlineRoom(false);
+    this.cancelAnalysis();
+    this.mode = nextMode;
+    this.settingsOpen = false;
+    this.analysisEnabled =
+      nextMode === "analysis" || (nextMode === "practice" && this.practiceLiveEval);
+    if (nextMode === "ai") {
+      this.orientation = this.humanColor;
+    } else if (nextMode === "analysis" || nextMode === "local") {
+      this.orientation = this.prefs.blackFirst ? "dark" : "light";
+    }
+    if (nextMode === "analysis") {
+      this.underboardTab = "opening";
+    }
+    this.renderShell();
+    if (nextMode === "online") {
+      void this.startNewGame();
+      void this.refreshOnlineLobby();
+    } else if (nextMode === "puzzles") {
+      void this.loadPuzzle(this.activePuzzleIdx);
+    } else if (nextMode === "practice") {
+      void this.loadPracticeDrill(this.activeModuleIdx, this.activeDrillIdx);
+    } else {
+      void this.startNewGame();
+    }
+  }
+
   private renderShell(): void {
     const t = this.t();
+    const preservedIoValue = this.ioTextarea?.value ?? "";
+    const boardLabelMap: Record<BoardTheme, string> = {
+      brown: t.boardBrown,
+      blue: t.boardBlue,
+      green: t.boardGreen,
+      walnut: t.boardWalnut,
+    };
+
+    const navModes: PlayMode[] = ["analysis", "ai", "local", "puzzles", "practice", "online"];
+    const navHtml = navModes
+      .map(
+        (m) => `
+          <button
+            type="button"
+            role="tab"
+            aria-selected="${this.mode === m}"
+            class="site-nav-btn ${this.mode === m ? "is-active" : ""}"
+            data-mode="${m}"
+          >
+            ${this.modeIcon(m)}
+            <span>${this.modeTitle(m)}</span>
+          </button>
+        `,
+      )
+      .join("");
+
+    const leftModeHtml = this.renderLeftModeHtml();
+    const showEval = this.shouldShowEvalBar();
+    const showOpeningTab = this.mode === "analysis";
+    const activeUnderboard = showOpeningTab ? this.underboardTab : "fen";
+
     this.root.innerHTML = `
-      <header class="topbar">
-        <div class="brand">
-          <h1>${t.appTitle}</h1>
-          <span class="subtitle">${t.subtitle}</span>
-        </div>
-        <div class="topbar-controls">
-          <div class="tab-group" role="tablist">
-            <button class="tab-btn ${this.mode === "analysis" ? "is-active" : ""}" data-mode="analysis">${t.modeAnalysis}</button>
-            <button class="tab-btn ${this.mode === "ai" ? "is-active" : ""}" data-mode="ai">${t.modeAi}</button>
-            <button class="tab-btn ${this.mode === "local" ? "is-active" : ""}" data-mode="local">${t.modeLocal}</button>
-            <button class="tab-btn ${this.mode === "puzzles" ? "is-active" : ""}" data-mode="puzzles">${t.modePuzzles}</button>
-            <button class="tab-btn ${this.mode === "practice" ? "is-active" : ""}" data-mode="practice">${t.modePractice}</button>
-            <button class="tab-btn ${this.mode === "online" ? "is-active" : ""}" data-mode="online">${t.modeOnline}</button>
+      <header class="site-header">
+        <div class="site-header-inner">
+          <div class="site-brand" aria-label="${t.appTitle}">
+            ${ICONS.logo}
+            <span class="site-brand-title">limakhos</span>
+            <span class="site-brand-sub">8</span>
           </div>
-          <button class="btn" id="btn-locale">${this.locale === "th" ? "EN" : "ไทย"}</button>
+
+          <nav class="site-nav" role="tablist" aria-label="Modes">
+            ${navHtml}
+          </nav>
+
+          <div class="site-utils">
+            <button type="button" class="user-chip" id="btn-user-chip" title="${t.onlineAccount}">
+              ${ICONS.user}
+              <span class="user-chip-name">${escapeHtml(this.authUser?.username ?? this.guestName)}</span>
+              ${
+                this.authUser
+                  ? `<span class="user-chip-rating">${Math.round(this.authUser.rating)}</span>`
+                  : ""
+              }
+            </button>
+
+            <button type="button" class="locale-btn" id="btn-locale" title="Language">
+              ${this.locale === "th" ? "EN" : "ไทย"}
+            </button>
+
+            <div class="settings-wrap" id="settings-wrap">
+              <button
+                type="button"
+                class="icon-btn ${this.settingsOpen ? "is-active" : ""}"
+                id="btn-settings"
+                aria-expanded="${this.settingsOpen}"
+                aria-haspopup="true"
+                aria-label="${t.settings}"
+                title="${t.settings}"
+              >
+                ${ICONS.settings}
+              </button>
+
+              <div class="settings-popover" id="settings-popover" ${this.settingsOpen ? "" : "hidden"}>
+                <div>
+                  <div class="settings-section-title">${t.uiTheme}</div>
+                  <div class="segmented-group">
+                    <button
+                      type="button"
+                      class="seg-btn ${this.prefs.uiTheme === "dark" ? "is-active" : ""}"
+                      data-ui-theme="dark"
+                    >
+                      ${ICONS.moon}
+                      <span>${t.themeDark}</span>
+                    </button>
+                    <button
+                      type="button"
+                      class="seg-btn ${this.prefs.uiTheme === "light" ? "is-active" : ""}"
+                      data-ui-theme="light"
+                    >
+                      ${ICONS.sun}
+                      <span>${t.themeLight}</span>
+                    </button>
+                  </div>
+                </div>
+
+                <div>
+                  <div class="settings-section-title">${t.boardTheme}</div>
+                  <div class="swatch-grid">
+                    ${BOARD_THEMES.map(
+                      (bt) => `
+                        <button
+                          type="button"
+                          class="swatch-btn ${this.prefs.boardTheme === bt.id ? "is-active" : ""}"
+                          data-board-theme="${bt.id}"
+                        >
+                          <span class="swatch-preview">
+                            <span style="background:${bt.lightHex}"></span>
+                            <span style="background:${bt.darkHex}"></span>
+                            <span style="background:${bt.darkHex}"></span>
+                            <span style="background:${bt.lightHex}"></span>
+                          </span>
+                          <span>${escapeHtml(boardLabelMap[bt.id])}</span>
+                        </button>
+                      `,
+                    ).join("")}
+                  </div>
+                </div>
+
+                <div>
+                  <div class="settings-section-title">${t.boardOptions}</div>
+                  <div class="theme-toggle-row">
+                    <span>${t.numbersToggle}</span>
+                    <button
+                      type="button"
+                      role="switch"
+                      aria-checked="${this.showNumbers}"
+                      class="li-switch ${this.showNumbers ? "is-on" : ""}"
+                      id="btn-nums"
+                    ></button>
+                  </div>
+                  <div class="theme-toggle-row">
+                    <span>${t.mainDiagToggle}</span>
+                    <button
+                      type="button"
+                      role="switch"
+                      aria-checked="${this.showMainDiagonal}"
+                      class="li-switch ${this.showMainDiagonal ? "is-on" : ""}"
+                      id="btn-diag"
+                    ></button>
+                  </div>
+                  <div class="theme-toggle-row">
+                    <span>${t.blackFirstToggle}</span>
+                    <button
+                      type="button"
+                      role="switch"
+                      aria-checked="${this.prefs.blackFirst}"
+                      class="li-switch ${this.prefs.blackFirst ? "is-on" : ""}"
+                      id="btn-black-first"
+                    ></button>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
         </div>
       </header>
 
-      <main class="workspace">
-        <section class="board-column">
-          <div class="player-bar" id="top-player"></div>
-          <div class="board-stage">
-            <div class="eval-bar" title="Evaluation (Light vs Dark)">
-              <span class="eval-bar-label is-top" id="eval-top">0.0</span>
-              <div class="eval-bar-fill" id="eval-fill" style="height: 50%"></div>
-              <span class="eval-bar-label is-bottom" id="eval-bottom"></span>
+      <main class="lichess-main">
+        <aside class="col-left">
+          <div class="li-box">
+            <div class="li-box-header">
+              <h2 class="li-box-title">${this.modeIcon(this.mode)} <span>${this.modeTitle(this.mode)}</span></h2>
+              <span class="li-badge">TCA 2025</span>
             </div>
-            <div id="board-mount"></div>
+            <div class="li-box-body">
+              <div id="status-box"></div>
+            </div>
           </div>
-          <div class="player-bar" id="bottom-player"></div>
-          <div class="board-toolbar">
-            <div class="toolbar-group">
-              ${
-                this.mode === "online" && this.onlineRoomId
-                  ? `<button class="btn is-danger" id="btn-leave-room">${t.leaveRoom}</button>`
-                  : `<button class="btn is-primary" id="btn-new">${t.newGame}</button>`
-              }
-              <button class="btn" id="btn-flip">${t.flipBoard}</button>
-              <button class="btn ${this.showNumbers ? "is-active" : ""}" id="btn-nums">${t.numbersToggle}</button>
-              <button class="btn ${this.showMainDiagonal ? "is-active" : ""}" id="btn-diag">${t.mainDiagToggle}</button>
+          ${leftModeHtml}
+        </aside>
+
+        <section class="col-center">
+          <div class="board-area">
+            <div class="board-stage ${showEval ? "" : "no-eval"}" id="board-stage">
+              <div class="eval-bar" title="${escapeHtml(t.evalBarLabel)}">
+                <span class="eval-bar-label is-top" id="eval-top">0.0</span>
+                <div class="eval-bar-fill" id="eval-fill" style="height: 50%"></div>
+                <span class="eval-bar-label is-bottom" id="eval-bottom"></span>
+              </div>
+              <div id="board-mount"></div>
             </div>
-            <div class="toolbar-group">
-              <button class="btn" id="btn-undo" ${this.mode === "online" ? "disabled" : ""}>${t.undo}</button>
-              <button class="btn is-danger" id="btn-resign">${t.resign}</button>
+          </div>
+
+          <div class="underboard li-box">
+            <div class="li-tabs" role="tablist">
+              ${
+                showOpeningTab
+                  ? `<button
+                      type="button"
+                      role="tab"
+                      aria-selected="${activeUnderboard === "opening"}"
+                      class="li-tab ${activeUnderboard === "opening" ? "is-active" : ""}"
+                      data-underboard-tab="opening"
+                    >
+                      ${ICONS.book}
+                      <span>${t.tabOpening}</span>
+                    </button>`
+                  : ""
+              }
+              <button
+                type="button"
+                role="tab"
+                aria-selected="${activeUnderboard === "fen"}"
+                class="li-tab ${activeUnderboard === "fen" ? "is-active" : ""}"
+                data-underboard-tab="fen"
+              >
+                ${ICONS.code}
+                <span>${t.tabFenPdn}</span>
+              </button>
+              <span class="toast-msg" id="toast-msg">${escapeHtml(this.toastMessage)}</span>
+            </div>
+            <div class="li-box-body">
+              ${
+                showOpeningTab
+                  ? `<div id="opening-card" ${activeUnderboard === "opening" ? "" : "hidden"}></div>`
+                  : ""
+              }
+              <div id="fen-panel" ${activeUnderboard === "fen" ? "" : "hidden"}>
+                <div class="io-box">
+                  <textarea
+                    id="io-text"
+                    class="li-textarea"
+                    placeholder="W:W1,2,3,4,5,6,7,8:B25,26,27,28,29,30,31,32  or  PDN..."
+                  >${escapeHtml(preservedIoValue)}</textarea>
+                  <div class="io-actions">
+                    <button type="button" class="li-btn is-sm" id="btn-copy-fen">${ICONS.copy} <span>${t.copyFen}</span></button>
+                    <button type="button" class="li-btn is-sm" id="btn-load-fen" ${this.mode === "online" ? "disabled" : ""}>${t.loadFen}</button>
+                    <button type="button" class="li-btn is-sm" id="btn-copy-pdn">${ICONS.copy} <span>${t.exportPdn}</span></button>
+                    <button type="button" class="li-btn is-sm" id="btn-import-pdn" ${this.mode === "online" ? "disabled" : ""}>${t.importPdn}</button>
+                  </div>
+                </div>
+              </div>
             </div>
           </div>
         </section>
 
-        <aside class="side-column">
-          <div id="status-box"></div>
-          ${this.mode === "online" ? `<div id="online-panel" class="online-stack"></div>` : ""}
-          ${this.mode === "puzzles" || this.mode === "practice" ? `<div id="study-panel" class="online-stack"></div>` : ""}
+        <aside class="col-right tools-panel">
+          <div id="top-player" class="player-strip is-top"></div>
 
-          ${
-            this.mode === "ai" || this.mode === "local"
-              ? `
-          <div class="card">
-            <div class="settings-grid">
+          <div class="li-box tools-box">
+            <div id="analysis-card" class="engine-box"></div>
+            <div id="moves-card"></div>
+
+            <div class="replay-bar">
+              <button type="button" id="nav-start" title="Home" aria-label="First move" ${this.cursor === 0 ? "disabled" : ""}>${ICONS.first}</button>
+              <button type="button" id="nav-prev" title="←" aria-label="Previous move" ${this.cursor === 0 ? "disabled" : ""}>${ICONS.prev}</button>
+              <button type="button" id="nav-next" title="→" aria-label="Next move" ${this.cursor >= this.timeline.length - 1 ? "disabled" : ""}>${ICONS.next}</button>
+              <button type="button" id="nav-end" title="End" aria-label="Latest move" ${this.cursor >= this.timeline.length - 1 ? "disabled" : ""}>${ICONS.last}</button>
+              <button type="button" id="btn-flip" title="${escapeHtml(t.flipBoard)} (F)" aria-label="${escapeHtml(t.flipBoard)}">${ICONS.flip}</button>
+            </div>
+
+            <div class="action-bar">
               ${
-                this.mode === "ai"
-                  ? `
-              <label class="field">
-                <span>${t.playAs}</span>
-                <select id="sel-side">
-                  <option value="light" ${this.humanColor === "light" ? "selected" : ""}>${t.lightSide}</option>
-                  <option value="dark" ${this.humanColor === "dark" ? "selected" : ""}>${t.darkSide}</option>
-                </select>
-              </label>
-              <label class="field">
-                <span>${t.aiLevel}</span>
-                <select id="sel-level">
-                  ${[1, 2, 3, 4, 5, 6, 7, 8]
-                    .map((lvl) => `<option value="${lvl}" ${this.aiLevel === lvl ? "selected" : ""}>Level ${lvl}</option>`)
-                    .join("")}
-                </select>
-              </label>
-              `
-                  : ""
+                this.mode === "online" && this.onlineRoomId
+                  ? `<button type="button" class="li-btn is-danger" id="btn-leave-room">${ICONS.leave} <span>${t.leaveRoom}</span></button>`
+                  : `<button type="button" class="li-btn is-primary" id="btn-new">${ICONS.newGame} <span>${t.newGame}</span></button>`
               }
-              <label class="field">
-                <span>${t.timeControl}</span>
-                <select id="sel-tc">
-                  ${TIME_CONTROLS.map(
-                    (tc) =>
-                      `<option value="${tc.id}" ${this.timeControlId === tc.id ? "selected" : ""}>${
-                        tc.id === "unlimited" ? t.unlimited : tc.label
-                      }</option>`,
-                  ).join("")}
-                </select>
-              </label>
+              <button type="button" class="li-btn" id="btn-undo" ${
+                this.mode === "online" || this.mode === "puzzles" ? "disabled" : ""
+              }>${ICONS.undo} <span>${t.undo}</span></button>
+              <button type="button" class="li-btn is-danger" id="btn-resign">${ICONS.resign} <span>${t.resign}</span></button>
             </div>
           </div>
-          `
-              : ""
-          }
 
-          <div class="card" id="analysis-card"></div>
-          ${this.mode === "analysis" ? `<div class="card" id="opening-card"></div>` : ""}
-          <div class="card" id="moves-card"></div>
-
-          <div class="card">
-            <div class="card-header">
-              <h2 class="card-title">${t.fenPdn}</h2>
-              <span class="toast" id="toast-msg">${this.toastMessage}</span>
-            </div>
-            <div class="io-box">
-              <textarea id="io-text" placeholder="W:W1,2,3,4,5,6,7,8:B25,26,27,28,29,30,31,32  or  PDN..."></textarea>
-              <div class="io-actions">
-                <button class="btn" id="btn-copy-fen">${t.copyFen}</button>
-                <button class="btn" id="btn-load-fen" ${this.mode === "online" ? "disabled" : ""}>${t.loadFen}</button>
-                <button class="btn" id="btn-copy-pdn">${t.exportPdn}</button>
-                <button class="btn" id="btn-import-pdn" ${this.mode === "online" ? "disabled" : ""}>${t.importPdn}</button>
-              </div>
-            </div>
-          </div>
+          <div id="bottom-player" class="player-strip is-bottom"></div>
         </aside>
       </main>
     `;
 
+    this.settingsWrapEl = this.root.querySelector("#settings-wrap");
+    this.settingsPopoverEl = this.root.querySelector("#settings-popover");
+    this.settingsBtnEl = this.root.querySelector("#btn-settings");
+    this.userChipEl = this.root.querySelector("#btn-user-chip");
+    this.boardStageEl = this.root.querySelector("#board-stage")!;
     this.boardMount = this.root.querySelector("#board-mount")!;
     this.evalFill = this.root.querySelector("#eval-fill")!;
     this.evalTopLabel = this.root.querySelector("#eval-top")!;
@@ -316,6 +617,7 @@ class LimakhosApp {
     this.studyPanelEl = this.root.querySelector("#study-panel");
     this.analysisPanelEl = this.root.querySelector("#analysis-card")!;
     this.openingPanelEl = this.root.querySelector("#opening-card");
+    this.fenPanelEl = this.root.querySelector("#fen-panel")!;
     this.movesPanelEl = this.root.querySelector("#moves-card")!;
     this.ioTextarea = this.root.querySelector("#io-text")!;
     this.toastEl = this.root.querySelector("#toast-msg")!;
@@ -341,37 +643,315 @@ class LimakhosApp {
     this.refreshPanels();
   }
 
+  private renderLeftModeHtml(): string {
+    const t = this.t();
+
+    if (this.mode === "ai" || this.mode === "local") {
+      return `
+        <div class="li-box">
+          <div class="li-box-header">
+            <h2 class="li-box-title">${t.settings}</h2>
+          </div>
+          <div class="li-box-body" style="display:flex;flex-direction:column;gap:10px;">
+            ${
+              this.mode === "ai"
+                ? `
+                  <div class="field">
+                    <span class="field-label">${t.playAs}</span>
+                    <div class="segmented-group" id="ai-side-group">
+                      <button type="button" class="seg-btn ${this.humanColor === "light" ? "is-active" : ""}" data-side="light">
+                        <span class="color-dot is-light"></span>
+                        <span>${t.lightShort}</span>
+                      </button>
+                      <button type="button" class="seg-btn ${this.humanColor === "dark" ? "is-active" : ""}" data-side="dark">
+                        <span class="color-dot is-dark"></span>
+                        <span>${t.darkShort}</span>
+                      </button>
+                    </div>
+                  </div>
+                  <div class="field">
+                    <span class="field-label">${t.aiLevel}</span>
+                    <div class="level-grid" id="ai-level-grid">
+                      ${[1, 2, 3, 4, 5, 6, 7, 8]
+                        .map(
+                          (lvl) => `
+                            <button type="button" class="level-btn ${this.aiLevel === lvl ? "is-active" : ""}" data-level="${lvl}">
+                              ${lvl}
+                            </button>
+                          `,
+                        )
+                        .join("")}
+                    </div>
+                  </div>
+                `
+                : ""
+            }
+            <div class="field">
+              <span class="field-label">${t.firstMover}</span>
+              <div class="segmented-group" id="first-mover-group">
+                <button type="button" class="seg-btn ${!this.prefs.blackFirst ? "is-active" : ""}" data-first-mover="light">
+                  <span class="color-dot is-light"></span>
+                  <span>${t.lightShort}</span>
+                </button>
+                <button type="button" class="seg-btn ${this.prefs.blackFirst ? "is-active" : ""}" data-first-mover="dark">
+                  <span class="color-dot is-dark"></span>
+                  <span>${t.darkShort}</span>
+                </button>
+              </div>
+            </div>
+            <div class="field">
+              <span class="field-label">${t.timeControl}</span>
+              <div class="segmented-group" id="tc-group">
+                ${TIME_CONTROLS.map(
+                  (tc) => `
+                    <button type="button" class="seg-btn ${this.timeControlId === tc.id ? "is-active" : ""}" data-tc="${tc.id}">
+                      ${escapeHtml(tc.label)}
+                    </button>
+                  `,
+                ).join("")}
+              </div>
+            </div>
+          </div>
+        </div>
+      `;
+    }
+
+    if (this.mode === "puzzles" || this.mode === "practice") {
+      return `<div id="study-panel" class="online-stack"></div>`;
+    }
+
+    if (this.mode === "online") {
+      return `<div id="online-panel" class="online-stack"></div>`;
+    }
+
+    // analysis mode: compact info/tips box
+    return `
+      <div class="li-box">
+        <div class="li-box-header">
+          <h2 class="li-box-title">${ICONS.spark} <span>${t.subtitle}</span></h2>
+        </div>
+        <div class="li-box-body" style="display:flex;flex-direction:column;gap:6px;font-size:0.78rem;color:var(--text-muted);">
+          <div>${escapeHtml(t.rightClickHint)}</div>
+          <div>${escapeHtml(t.shortcutsHint)}</div>
+        </div>
+      </div>
+    `;
+  }
+
+  private syncSettingsPopover(): void {
+    if (this.settingsPopoverEl) {
+      this.settingsPopoverEl.hidden = !this.settingsOpen;
+    }
+    if (this.settingsBtnEl) {
+      this.settingsBtnEl.classList.toggle("is-active", this.settingsOpen);
+      this.settingsBtnEl.setAttribute("aria-expanded", String(this.settingsOpen));
+    }
+    this.root.querySelectorAll<HTMLButtonElement>("[data-ui-theme]").forEach((btn) => {
+      btn.classList.toggle("is-active", btn.dataset.uiTheme === this.prefs.uiTheme);
+    });
+    this.root.querySelectorAll<HTMLButtonElement>("[data-board-theme]").forEach((btn) => {
+      btn.classList.toggle("is-active", btn.dataset.boardTheme === this.prefs.boardTheme);
+    });
+    const numsBtn = this.root.querySelector<HTMLButtonElement>("#btn-nums");
+    if (numsBtn) {
+      numsBtn.classList.toggle("is-on", this.showNumbers);
+      numsBtn.setAttribute("aria-checked", String(this.showNumbers));
+    }
+    const diagBtn = this.root.querySelector<HTMLButtonElement>("#btn-diag");
+    if (diagBtn) {
+      diagBtn.classList.toggle("is-on", this.showMainDiagonal);
+      diagBtn.setAttribute("aria-checked", String(this.showMainDiagonal));
+    }
+    const blackFirstBtn = this.root.querySelector<HTMLButtonElement>("#btn-black-first");
+    if (blackFirstBtn) {
+      blackFirstBtn.classList.toggle("is-on", this.prefs.blackFirst);
+      blackFirstBtn.setAttribute("aria-checked", String(this.prefs.blackFirst));
+    }
+    this.root.querySelectorAll<HTMLButtonElement>("[data-first-mover]").forEach((btn) => {
+      const wantDark = btn.dataset.firstMover === "dark";
+      btn.classList.toggle("is-active", wantDark === this.prefs.blackFirst);
+    });
+  }
+
+  private setBlackFirst(enabled: boolean): void {
+    this.updatePrefs({ blackFirst: enabled });
+    this.syncSettingsPopover();
+    if (this.mode === "analysis" || this.mode === "local") {
+      this.orientation = enabled ? "dark" : "light";
+    }
+    if (this.mode === "analysis" || this.mode === "ai" || this.mode === "local") {
+      void this.startNewGame();
+    }
+  }
+
+  private renderUserChip(): void {
+    if (!this.userChipEl) return;
+    this.userChipEl.innerHTML = `
+      ${ICONS.user}
+      <span class="user-chip-name">${escapeHtml(this.authUser?.username ?? this.guestName)}</span>
+      ${
+        this.authUser
+          ? `<span class="user-chip-rating">${Math.round(this.authUser.rating)}</span>`
+          : ""
+      }
+    `;
+  }
+
+  private syncUnderboardTabs(): void {
+    const showOpening = this.mode === "analysis";
+    const activeTab = showOpening ? this.underboardTab : "fen";
+    this.root.querySelectorAll<HTMLButtonElement>("[data-underboard-tab]").forEach((btn) => {
+      const isActive = btn.dataset.underboardTab === activeTab;
+      btn.classList.toggle("is-active", isActive);
+      btn.setAttribute("aria-selected", String(isActive));
+    });
+    if (this.openingPanelEl) {
+      this.openingPanelEl.hidden = !(showOpening && activeTab === "opening");
+    }
+    if (this.fenPanelEl) {
+      this.fenPanelEl.hidden = showOpening && activeTab === "opening";
+    }
+  }
+
   private bindControls(): void {
     this.root.querySelectorAll<HTMLButtonElement>("[data-mode]").forEach((btn) => {
       btn.addEventListener("click", () => {
         const nextMode = btn.dataset.mode as PlayMode;
-        if (nextMode === this.mode) return;
-        this.leaveOnlineRoom(false);
-        this.mode = nextMode;
-        this.analysisEnabled =
-          nextMode === "analysis" || (nextMode === "practice" && this.practiceLiveEval);
-        if (nextMode === "ai") {
-          this.orientation = this.humanColor;
-        }
-        this.renderShell();
-        if (nextMode === "online") {
-          void this.startNewGame();
-          void this.refreshOnlineLobby();
-        } else if (nextMode === "puzzles") {
-          void this.loadPuzzle(this.activePuzzleIdx);
-        } else if (nextMode === "practice") {
-          void this.loadPracticeDrill(this.activeModuleIdx, this.activeDrillIdx);
-        } else {
-          void this.startNewGame();
-        }
+        this.switchMode(nextMode);
       });
     });
 
+    this.userChipEl?.addEventListener("click", () => {
+      this.switchMode("online");
+    });
+
     this.root.querySelector("#btn-locale")?.addEventListener("click", () => {
-      this.locale = this.locale === "th" ? "en" : "th";
+      const nextLocale: Locale = this.locale === "th" ? "en" : "th";
+      this.updatePrefs({ locale: nextLocale });
       this.renderShell();
     });
 
+    this.settingsBtnEl?.addEventListener("click", (ev) => {
+      ev.stopPropagation();
+      this.settingsOpen = !this.settingsOpen;
+      this.syncSettingsPopover();
+    });
+
+    this.root.querySelectorAll<HTMLButtonElement>("[data-ui-theme]").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const uiTheme = btn.dataset.uiTheme as UiTheme;
+        if (uiTheme !== "dark" && uiTheme !== "light") return;
+        this.updatePrefs({ uiTheme });
+        this.syncSettingsPopover();
+      });
+    });
+
+    this.root.querySelectorAll<HTMLButtonElement>("[data-board-theme]").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const boardTheme = btn.dataset.boardTheme as BoardTheme;
+        this.updatePrefs({ boardTheme });
+        this.syncSettingsPopover();
+      });
+    });
+
+    this.root.querySelector("#btn-nums")?.addEventListener("click", () => {
+      this.updatePrefs({ showNumbers: !this.showNumbers });
+      this.syncSettingsPopover();
+      this.syncBoard();
+    });
+
+    this.root.querySelector("#btn-diag")?.addEventListener("click", () => {
+      this.updatePrefs({ showMainDiagonal: !this.showMainDiagonal });
+      this.syncSettingsPopover();
+      this.syncBoard();
+    });
+
+    this.root.querySelector("#btn-black-first")?.addEventListener("click", () => {
+      this.setBlackFirst(!this.prefs.blackFirst);
+    });
+
+    this.root.querySelectorAll<HTMLButtonElement>("[data-first-mover]").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const enabled = btn.dataset.firstMover === "dark";
+        if (enabled === this.prefs.blackFirst) return;
+        this.setBlackFirst(enabled);
+      });
+    });
+
+    this.root.querySelectorAll<HTMLButtonElement>("[data-underboard-tab]").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const tab = btn.dataset.underboardTab as "opening" | "fen";
+        if (tab !== "opening" && tab !== "fen") return;
+        this.underboardTab = tab;
+        this.syncUnderboardTabs();
+      });
+    });
+
+    this.root.querySelectorAll<HTMLButtonElement>("[data-side]").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const side = btn.dataset.side as Color;
+        if (side !== "light" && side !== "dark") return;
+        this.humanColor = side;
+        this.orientation = side;
+        this.root.querySelectorAll<HTMLButtonElement>("[data-side]").forEach((b) => {
+          b.classList.toggle("is-active", b.dataset.side === side);
+        });
+        void this.startNewGame();
+      });
+    });
+
+    this.root.querySelectorAll<HTMLButtonElement>("[data-level]").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const lvl = Number(btn.dataset.level);
+        if (!Number.isFinite(lvl)) return;
+        this.aiLevel = lvl;
+        this.root.querySelectorAll<HTMLButtonElement>("[data-level]").forEach((b) => {
+          b.classList.toggle("is-active", Number(b.dataset.level) === lvl);
+        });
+      });
+    });
+
+    this.root.querySelectorAll<HTMLButtonElement>("[data-tc]").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const tcId = btn.dataset.tc;
+        if (!tcId) return;
+        this.timeControlId = tcId;
+        this.root.querySelectorAll<HTMLButtonElement>("[data-tc]").forEach((b) => {
+          b.classList.toggle("is-active", b.dataset.tc === tcId);
+        });
+        void this.startNewGame();
+      });
+    });
+
+    // Replay bar
+    this.root.querySelector("#nav-start")?.addEventListener("click", () => {
+      this.cursor = 0;
+      void this.inspectCursor();
+    });
+    this.root.querySelector("#nav-prev")?.addEventListener("click", () => {
+      if (this.cursor > 0) {
+        this.cursor -= 1;
+        void this.inspectCursor();
+      }
+    });
+    this.root.querySelector("#nav-next")?.addEventListener("click", () => {
+      if (this.cursor < this.timeline.length - 1) {
+        this.cursor += 1;
+        void this.inspectCursor();
+      }
+    });
+    this.root.querySelector("#nav-end")?.addEventListener("click", () => {
+      this.cursor = this.timeline.length - 1;
+      void this.inspectCursor();
+    });
+    this.root.querySelector("#btn-flip")?.addEventListener("click", () => {
+      this.orientation = this.orientation === "light" ? "dark" : "light";
+      this.syncBoard();
+      this.renderPlayerBars();
+      this.renderEvalBar();
+    });
+
+    // Action bar
     this.root.querySelector("#btn-new")?.addEventListener("click", () => {
       if (this.mode === "puzzles") {
         void this.loadPuzzle(this.activePuzzleIdx);
@@ -384,38 +964,10 @@ class LimakhosApp {
     this.root.querySelector("#btn-leave-room")?.addEventListener("click", () => {
       this.leaveOnlineRoom(true);
     });
-    this.root.querySelector("#btn-flip")?.addEventListener("click", () => {
-      this.orientation = this.orientation === "light" ? "dark" : "light";
-      this.syncBoard();
-      this.renderPlayerBars();
-      this.renderEvalBar();
-    });
-    this.root.querySelector("#btn-nums")?.addEventListener("click", () => {
-      this.showNumbers = !this.showNumbers;
-      this.root.querySelector("#btn-nums")?.classList.toggle("is-active", this.showNumbers);
-      this.syncBoard();
-    });
-    this.root.querySelector("#btn-diag")?.addEventListener("click", () => {
-      this.showMainDiagonal = !this.showMainDiagonal;
-      this.root.querySelector("#btn-diag")?.classList.toggle("is-active", this.showMainDiagonal);
-      this.syncBoard();
-    });
     this.root.querySelector("#btn-undo")?.addEventListener("click", () => void this.handleUndo());
     this.root.querySelector("#btn-resign")?.addEventListener("click", () => this.handleResign());
 
-    this.root.querySelector<HTMLSelectElement>("#sel-side")?.addEventListener("change", (ev) => {
-      this.humanColor = (ev.target as HTMLSelectElement).value as Color;
-      this.orientation = this.humanColor;
-      void this.startNewGame();
-    });
-    this.root.querySelector<HTMLSelectElement>("#sel-level")?.addEventListener("change", (ev) => {
-      this.aiLevel = Number((ev.target as HTMLSelectElement).value);
-    });
-    this.root.querySelector<HTMLSelectElement>("#sel-tc")?.addEventListener("change", (ev) => {
-      this.timeControlId = (ev.target as HTMLSelectElement).value;
-      void this.startNewGame();
-    });
-
+    // FEN / PDN I/O
     this.root.querySelector("#btn-copy-fen")?.addEventListener("click", () => {
       const fen = this.currentSnapshot?.fen ?? "";
       this.ioTextarea.value = fen;
@@ -463,6 +1015,7 @@ class LimakhosApp {
         this.leaveOnlineRoom(false);
         this.mode = "analysis";
         this.analysisEnabled = true;
+        this.underboardTab = "opening";
         this.renderShell();
       }
       this.stopClock();
@@ -483,12 +1036,20 @@ class LimakhosApp {
 
   private async startNewGame(customFen?: string): Promise<void> {
     this.stopClock();
+    this.cancelAnalysis();
     this.forcedOutcome = null;
     this.aiThinking = false;
     this.lastAnalysis = null;
-    await this.engine.clearCache();
+    this.lastAnalysisMs = 0;
+    void this.engine.clearCache();
 
-    const snap = await this.engine.inspect(customFen);
+    const effectiveFen =
+      customFen ??
+      (this.prefs.blackFirst &&
+      (this.mode === "analysis" || this.mode === "ai" || this.mode === "local")
+        ? BLACK_FIRST_START_FEN
+        : undefined);
+    const snap = await this.engine.inspect(effectiveFen);
     this.timeline = [{ fen: snap.fen, hash: snap.hash, notation: null, lastMove: null }];
     this.cursor = 0;
     this.currentSnapshot = snap;
@@ -578,6 +1139,7 @@ class LimakhosApp {
 
   private async commitNotation(moveNotation: string): Promise<void> {
     if (!this.currentSnapshot) return;
+    this.cancelAnalysis();
     const mover = this.currentSnapshot.side_to_move;
     const hashes = this.historyHashesUpTo(this.cursor);
     const res = await this.engine.applyMove(this.currentSnapshot.fen, moveNotation, hashes);
@@ -595,6 +1157,7 @@ class LimakhosApp {
     this.cursor = this.timeline.length - 1;
     this.currentSnapshot = res.snapshot;
     this.lastAnalysis = null;
+    this.lastAnalysisMs = 0;
 
     const tc = this.activeTimeControl();
     if (tc.initialMs > 0 && (this.mode === "ai" || this.mode === "local")) {
@@ -650,17 +1213,30 @@ class LimakhosApp {
     }
   }
 
+  private cancelAnalysis(): void {
+    this.analysisSeq += 1;
+    this.analysisBusy = false;
+    this.engine.cancelAnalysis();
+  }
+
   private async triggerAnalysisIfEnabled(): Promise<void> {
     if (this.mode === "online" && this.onlineState?.status === "active") {
+      this.cancelAnalysis();
       this.lastAnalysis = null;
+      this.lastAnalysisMs = 0;
       this.renderAnalysisPanel();
       this.renderEvalBar();
       return;
     }
-    if (!this.analysisEnabled || !this.currentSnapshot) return;
+    if (!this.analysisEnabled || !this.currentSnapshot) {
+      this.cancelAnalysis();
+      return;
+    }
     if (this.effectiveOutcome().type !== "ongoing") {
+      this.cancelAnalysis();
       this.lastAnalysis = null;
-      this.syncBoard();
+      this.lastAnalysisMs = 0;
+      this.board.setArrows(this.computeBoardArrows());
       this.renderAnalysisPanel();
       this.renderEvalBar();
       return;
@@ -670,25 +1246,44 @@ class LimakhosApp {
     const fen = this.currentSnapshot.fen;
     const hashes = this.historyHashesUpTo(this.cursor);
     this.analysisBusy = true;
+    this.lastAnalysis = null;
+    this.lastAnalysisMs = 0;
+    this.board.setArrows(this.computeBoardArrows());
     this.renderAnalysisPanel();
+    this.renderEvalBar();
 
     const t0 = performance.now();
     try {
       const res = await this.engine.analyze(fen, {
         maxDepth: this.analysisDepth,
-        maxNodes: 350_000,
+        maxNodes: this.analysisTimeMs === 0 ? 0 : undefined,
+        maxTimeMs: this.analysisTimeMs > 0 ? this.analysisTimeMs : undefined,
+        threads: this.analysisThreads,
         multipv: this.analysisMultiPv,
         historyHashes: hashes,
+        legalMoves: this.currentSnapshot.legal_moves.map((m) => m.long_notation),
+        onProgress: (update) => {
+          if (seq !== this.analysisSeq) return;
+          this.lastAnalysis = {
+            depth: update.depth,
+            nodes: update.nodes,
+            lines: update.lines,
+          };
+          this.lastAnalysisMs = Math.max(1, Math.round(performance.now() - t0));
+          this.board.setArrows(this.computeBoardArrows());
+          this.renderAnalysisPanel();
+          this.renderEvalBar();
+        },
       });
       if (seq !== this.analysisSeq) return;
       this.lastAnalysis = res;
       this.lastAnalysisMs = Math.max(1, Math.round(performance.now() - t0));
       this.analysisBusy = false;
-      this.syncBoard();
+      this.board.setArrows(this.computeBoardArrows());
       this.renderAnalysisPanel();
       this.renderEvalBar();
-    } catch {
-      if (seq !== this.analysisSeq) return;
+    } catch (err) {
+      if (seq !== this.analysisSeq || err instanceof AnalysisCancelledError) return;
       this.analysisBusy = false;
       this.renderAnalysisPanel();
     }
@@ -697,6 +1292,7 @@ class LimakhosApp {
   private async inspectCursor(): Promise<void> {
     const entry = this.timeline[this.cursor];
     if (!entry) return;
+    this.cancelAnalysis();
     if (this.mode === "online" && this.onlineState && this.isAtLatestPly()) {
       this.currentSnapshot = this.snapshotFromOnline(this.onlineState);
       this.syncBoard();
@@ -706,6 +1302,7 @@ class LimakhosApp {
     const hashes = this.historyHashesUpTo(this.cursor);
     this.currentSnapshot = await this.engine.inspect(entry.fen, hashes);
     this.lastAnalysis = null;
+    this.lastAnalysisMs = 0;
     this.syncBoard();
     this.refreshPanels();
     void this.triggerAnalysisIfEnabled();
@@ -737,12 +1334,24 @@ class LimakhosApp {
       reason: "resignation",
     };
     this.stopClock();
+    this.cancelAnalysis();
     this.syncBoard();
     this.refreshPanels();
   }
 
   private handleKeydown(ev: KeyboardEvent): void {
-    if (ev.target instanceof HTMLTextAreaElement || ev.target instanceof HTMLInputElement) return;
+    if (ev.key === "Escape" && this.settingsOpen) {
+      this.settingsOpen = false;
+      this.syncSettingsPopover();
+      return;
+    }
+    if (
+      ev.target instanceof HTMLTextAreaElement ||
+      ev.target instanceof HTMLInputElement ||
+      ev.target instanceof HTMLSelectElement
+    ) {
+      return;
+    }
     if (ev.key === "ArrowLeft" && this.cursor > 0) {
       this.cursor -= 1;
       void this.inspectCursor();
@@ -843,6 +1452,7 @@ class LimakhosApp {
     } else {
       this.authUser = null;
     }
+    this.renderUserChip();
 
     const [roomsRes, lbRes, gamesRes] = await Promise.allSettled([
       this.online.listRooms(),
@@ -865,6 +1475,7 @@ class LimakhosApp {
       this.authToken = res.token;
       this.authUser = res.user;
       localStorage.setItem(LS_TOKEN_KEY, res.token);
+      this.renderUserChip();
       this.showToast(`${res.user.username}`);
       await this.refreshOnlineLobby();
     } catch (err) {
@@ -877,6 +1488,7 @@ class LimakhosApp {
     this.authToken = null;
     this.authUser = null;
     localStorage.removeItem(LS_TOKEN_KEY);
+    this.renderUserChip();
     this.renderOnlinePanel();
   }
 
@@ -1009,7 +1621,6 @@ class LimakhosApp {
         this.cursor = this.timeline.length - 1;
       }
     } else if (this.timeline.length !== expectedLen) {
-      // Reconnected or joined mid-game: hydrate full history via local WASM PDN importer
       const seq = ++this.onlineSyncSeq;
       this.timeline = state.notations.map((tok, i) => ({
         fen: state.fen,
@@ -1063,15 +1674,17 @@ class LimakhosApp {
       arrows.push(this.practiceHintArrow);
     }
     if (this.analysisEnabled && this.lastAnalysis && this.lastAnalysis.lines.length > 0) {
-      const palette = ["#22c55e", "#38bdf8", "#f59e0b"];
+      const palette = ["#15781B", "#003088", "#e68f00"];
+      const opacities = [0.84, 0.56, 0.48];
+      const widths = [14, 11, 9];
       this.lastAnalysis.lines.slice(0, 3).forEach((line, i) => {
         arrows.push({
           from: line.best_move.from,
           to: line.best_move.to,
           path: line.best_move.path,
-          color: palette[i] ?? "#38bdf8",
-          opacity: i === 0 ? 0.84 : 0.48,
-          width: i === 0 ? 15 : 10,
+          color: palette[i] ?? "#003088",
+          opacity: opacities[i] ?? 0.48,
+          width: widths[i] ?? 9,
         });
       });
     }
@@ -1116,24 +1729,33 @@ class LimakhosApp {
     if (this.mode === "online" && this.onlineState) {
       const s = this.onlineState;
       const activeTurn = s.status === "active" && s.outcome.type === "ongoing" ? s.side_to_move : null;
+      const timed = s.initial_ms > 0;
       const renderOnlineBar = (el: HTMLElement, c: Color) => {
         const seat = c === "light" ? s.light : s.dark;
-        const name = seat ? escapeHtml(seat.name) : `${c === "light" ? t.lightSide : t.darkSide} (${t.waitingOpponent})`;
+        const name = seat
+          ? escapeHtml(seat.name)
+          : `${c === "light" ? t.lightShort : t.darkShort} (${t.waitingOpponent})`;
         const ratingBadge =
-          seat && seat.rating !== null ? `<span class="badge-muted">(${Math.round(seat.rating)})</span>` : "";
+          seat && seat.rating !== null ? `<span class="li-badge">${Math.round(seat.rating)}</span>` : "";
         const offlineBadge =
-          seat && !seat.connected ? `<span class="pill is-warn">${t.disconnected}</span>` : "";
-        const running = s.initial_ms > 0 && activeTurn === c;
+          seat && !seat.connected ? `<span class="li-badge is-warn">${t.disconnected}</span>` : "";
+        const running = timed && activeTurn === c;
         const low = running && this.clocksMs[c] < 15_000;
-        const clockText = s.initial_ms > 0 ? formatClockMs(this.clocksMs[c]) : "∞";
+        const clockHtml = timed
+          ? `<div class="player-clock ${running ? "is-running" : ""} ${low ? "is-low" : ""}">${formatClockMs(
+              this.clocksMs[c],
+            )}</div>`
+          : "";
         el.innerHTML = `
-          <div class="player-name">
-            <span class="color-dot is-${c}"></span>
-            <span>${name}</span>
-            ${ratingBadge}
-            ${offlineBadge}
+          <div class="player-info">
+            <div class="player-name">
+              <span class="color-dot is-${c}"></span>
+              <span>${name}</span>
+              ${ratingBadge}
+              ${offlineBadge}
+            </div>
           </div>
-          <div class="clock ${running ? "is-running" : ""} ${low ? "is-low" : ""}">${clockText}</div>
+          ${clockHtml}
         `;
       };
       renderOnlineBar(this.topPlayerEl, topColor);
@@ -1146,22 +1768,28 @@ class LimakhosApp {
 
     const labelFor = (c: Color) => {
       if (this.mode === "ai" && c !== this.humanColor) {
-        return `${c === "light" ? t.lightSide : t.darkSide} — AI L${this.aiLevel}`;
+        return `${c === "light" ? t.lightShort : t.darkShort} — AI L${this.aiLevel}`;
       }
       return c === "light" ? t.lightSide : t.darkSide;
     };
 
+    const timed = tc.initialMs > 0 && (this.mode === "ai" || this.mode === "local");
     const renderBar = (el: HTMLElement, c: Color) => {
-      const timed = tc.initialMs > 0 && (this.mode === "ai" || this.mode === "local");
       const running = timed && activeTurn === c;
       const low = running && this.clocksMs[c] < 15_000;
-      const clockText = timed ? formatClockMs(this.clocksMs[c]) : "∞";
+      const clockHtml = timed
+        ? `<div class="player-clock ${running ? "is-running" : ""} ${low ? "is-low" : ""}">${formatClockMs(
+            this.clocksMs[c],
+          )}</div>`
+        : "";
       el.innerHTML = `
-        <div class="player-name">
-          <span class="color-dot is-${c}"></span>
-          <span>${labelFor(c)}</span>
+        <div class="player-info">
+          <div class="player-name">
+            <span class="color-dot is-${c}"></span>
+            <span>${escapeHtml(labelFor(c))}</span>
+          </div>
         </div>
-        <div class="clock ${running ? "is-running" : ""} ${low ? "is-low" : ""}">${clockText}</div>
+        ${clockHtml}
       `;
     };
 
@@ -1197,33 +1825,81 @@ class LimakhosApp {
     }
 
     const kingFullMoves = snap ? Math.floor(snap.king_only_plies / 2) : 0;
-    const capturePill =
+    const captureBadge =
       snap && snap.has_capture && outcome.type === "ongoing"
-        ? `<span class="pill is-warn">${t.mandatoryCapture}</span>`
+        ? `<span class="li-badge is-warn">${t.mandatoryCapture}</span>`
         : "";
-    const drawPill =
-      kingFullMoves > 0
-        ? `<span class="pill ${kingFullMoves >= 12 ? "is-warn" : ""}">${t.sixteenMoveCounter}: ${kingFullMoves}/16</span>`
-        : "";
-    const specPill =
+    const specBadge =
       this.mode === "online" && this.onlineState
-        ? `<span class="pill">${
+        ? `<span class="li-badge is-accent">${ICONS.eye} ${
             this.onlineRole === "spectator" ? t.spectating : `${t.spectators}: ${this.onlineState.spectators}`
           }</span>`
         : "";
 
-    let ratingPill = "";
+    let ratingBadge = "";
     if (this.mode === "online" && this.onlineState?.rating_changes) {
       const rc = this.onlineState.rating_changes;
       const dl = Math.round(rc.light_after - rc.light_before);
       const dd = Math.round(rc.dark_after - rc.dark_before);
-      ratingPill = `<span class="pill">L ${dl >= 0 ? "+" : ""}${dl} / D ${dd >= 0 ? "+" : ""}${dd}</span>`;
+      ratingBadge = `<span class="li-badge">L ${dl >= 0 ? "+" : ""}${dl} / D ${dd >= 0 ? "+" : ""}${dd}</span>`;
     }
 
+    const ruleMeterHtml =
+      kingFullMoves > 0
+        ? `
+          <div style="display:flex;flex-direction:column;gap:4px;">
+            <div class="status-strip-row" style="font-size:0.75rem;color:var(--text-muted);">
+              <span>${t.sixteenMoveCounter}</span>
+              <span class="li-badge ${kingFullMoves >= 12 ? "is-warn" : ""}">${kingFullMoves}/16</span>
+            </div>
+            <div class="rule-meter">
+              <div class="rule-meter-fill" style="width:${Math.min(100, Math.round((kingFullMoves / 16) * 100))}%"></div>
+            </div>
+          </div>
+        `
+        : "";
+
+    const pieces = snap?.pieces ?? [];
+    let lightTotal = 0;
+    let lightKings = 0;
+    let darkTotal = 0;
+    let darkKings = 0;
+    for (const p of pieces) {
+      if (p.color === "light") {
+        lightTotal += 1;
+        if (p.kind === "king") lightKings += 1;
+      } else {
+        darkTotal += 1;
+        if (p.kind === "king") darkKings += 1;
+      }
+    }
+
+    const pieceCountHtml = snap
+      ? `
+        <div class="status-strip-row" style="font-size:0.76rem;color:var(--text-muted);padding-top:4px;border-top:1px solid var(--border-subtle);">
+          <span>${t.piecesCount}</span>
+          <span style="display:inline-flex;align-items:center;gap:10px;font-family:var(--font-mono);color:var(--text);">
+            <span style="display:inline-flex;align-items:center;gap:4px;">
+              <span class="color-dot is-light" style="width:9px;height:9px;"></span>
+              ${lightTotal}${lightKings > 0 ? ` (${lightKings}K)` : ""}
+            </span>
+            <span style="display:inline-flex;align-items:center;gap:4px;">
+              <span class="color-dot is-dark" style="width:9px;height:9px;"></span>
+              ${darkTotal}${darkKings > 0 ? ` (${darkKings}K)` : ""}
+            </span>
+          </span>
+        </div>
+      `
+      : "";
+
     this.statusEl.innerHTML = `
-      <div class="status-banner ${outcome.type !== "ongoing" ? "is-over" : ""}">
-        <span>${text}</span>
-        <div style="display:flex;gap:6px;flex-wrap:wrap;">${capturePill}${drawPill}${specPill}${ratingPill}</div>
+      <div class="status-strip ${outcome.type !== "ongoing" ? "is-over" : ""}">
+        <div class="status-strip-row">
+          <span>${escapeHtml(text)}</span>
+          ${captureBadge || specBadge || ratingBadge ? `<div style="display:flex;gap:6px;flex-wrap:wrap;">${captureBadge}${specBadge}${ratingBadge}</div>` : ""}
+        </div>
+        ${ruleMeterHtml}
+        ${pieceCountHtml}
       </div>
     `;
   }
@@ -1240,20 +1916,22 @@ class LimakhosApp {
       ? (() => {
           const url = `${window.location.origin}${window.location.pathname}?room=${encodeURIComponent(this.onlineRoomId)}`;
           return `
-            <div class="card">
-              <div class="card-header">
-                <h2 class="card-title">Room ${escapeHtml(this.onlineRoomId)}</h2>
-                <button class="btn is-danger" id="btn-inline-leave">${t.leaveRoom}</button>
+            <div class="li-box">
+              <div class="li-box-header">
+                <h2 class="li-box-title">Room ${escapeHtml(this.onlineRoomId)}</h2>
+                <button type="button" class="li-btn is-sm is-danger" id="btn-inline-leave">${ICONS.leave} <span>${t.leaveRoom}</span></button>
               </div>
-              <div class="invite-bar">
-                <code>${escapeHtml(url)}</code>
-                <button class="btn is-primary" id="btn-copy-invite">${t.copyInvite}</button>
+              <div class="li-box-body" style="display:flex;flex-direction:column;gap:8px;">
+                <div class="invite-bar">
+                  <code>${escapeHtml(url)}</code>
+                  <button type="button" class="li-btn is-sm is-primary" id="btn-copy-invite">${ICONS.copy} <span>${t.copyInvite}</span></button>
+                </div>
+                ${
+                  this.onlineState?.status === "finished"
+                    ? `<div><button type="button" class="li-btn is-sm is-primary" id="btn-analyze-finished">${t.analyzeGame}</button></div>`
+                    : ""
+                }
               </div>
-              ${
-                this.onlineState?.status === "finished"
-                  ? `<div style="margin-top:8px;"><button class="btn is-primary" id="btn-analyze-finished">${t.analyzeGame}</button></div>`
-                  : ""
-              }
             </div>
           `;
         })()
@@ -1261,34 +1939,36 @@ class LimakhosApp {
 
     const accountHtml = this.authUser
       ? `
-        <div class="card">
-          <div class="card-header">
-            <h2 class="card-title">${t.onlineAccount}</h2>
-            <button class="btn" id="btn-logout">${t.logout}</button>
+        <div class="li-box">
+          <div class="li-box-header">
+            <h2 class="li-box-title">${ICONS.user} <span>${t.onlineAccount}</span></h2>
+            <button type="button" class="li-btn is-sm" id="btn-logout">${t.logout}</button>
           </div>
-          <div class="inline-row" style="justify-content:space-between;">
-            <strong>${escapeHtml(this.authUser.username)}</strong>
-            <span class="pill">${t.ratingLabel}: ${Math.round(this.authUser.rating)} (${this.authUser.wins}W-${this.authUser.losses}L-${this.authUser.draws}D)</span>
+          <div class="li-box-body">
+            <div class="inline-row" style="justify-content:space-between;">
+              <strong>${escapeHtml(this.authUser.username)}</strong>
+              <span class="li-badge is-accent">${t.ratingLabel}: ${Math.round(this.authUser.rating)} (${this.authUser.wins}W-${this.authUser.losses}L-${this.authUser.draws}D)</span>
+            </div>
           </div>
         </div>
       `
       : `
-        <div class="card">
-          <div class="card-header">
-            <h2 class="card-title">${t.onlineAccount}</h2>
+        <div class="li-box">
+          <div class="li-box-header">
+            <h2 class="li-box-title">${ICONS.user} <span>${t.onlineAccount}</span></h2>
           </div>
-          <div class="online-stack">
+          <div class="li-box-body online-stack">
             <label class="field">
-              <span>${t.guestName}</span>
-              <input id="inp-guest-name" value="${escapeHtml(this.guestName)}" maxlength="24" />
+              <span class="field-label">${t.guestName}</span>
+              <input class="li-input" id="inp-guest-name" value="${escapeHtml(this.guestName)}" maxlength="24" />
             </label>
             <div class="inline-row">
-              <input id="inp-auth-user" placeholder="${t.username}" maxlength="24" />
-              <input id="inp-auth-pass" type="password" placeholder="${t.password}" />
+              <input class="li-input" id="inp-auth-user" placeholder="${t.username}" maxlength="24" />
+              <input class="li-input" id="inp-auth-pass" type="password" placeholder="${t.password}" />
             </div>
             <div class="inline-row">
-              <button class="btn is-primary" id="btn-login">${t.login}</button>
-              <button class="btn" id="btn-register">${t.register}</button>
+              <button type="button" class="li-btn is-sm is-primary" id="btn-login">${t.login}</button>
+              <button type="button" class="li-btn is-sm" id="btn-register">${t.register}</button>
             </div>
           </div>
         </div>
@@ -1296,7 +1976,7 @@ class LimakhosApp {
 
     const roomsHtml =
       this.openRooms.length === 0
-        ? `<div class="badge-muted">${t.noOpenRooms}</div>`
+        ? `<div class="li-box-body badge-muted">${t.noOpenRooms}</div>`
         : this.openRooms
             .map((r) => {
               const lName = r.light ? escapeHtml(r.light.name) : "—";
@@ -1311,102 +1991,113 @@ class LimakhosApp {
                   <div class="inline-row">
                     ${
                       joinable
-                        ? `<button class="btn is-primary" data-join-room="${escapeHtml(r.id)}">${t.joinRoom}</button>`
+                        ? `<button type="button" class="li-btn is-sm is-primary" data-join-room="${escapeHtml(r.id)}">${t.joinRoom}</button>`
                         : ""
                     }
-                    <button class="btn" data-watch-room="${escapeHtml(r.id)}">${t.watchRoom}</button>
+                    <button type="button" class="li-btn is-sm" data-watch-room="${escapeHtml(r.id)}">${t.watchRoom}</button>
                   </div>
                 </div>
               `;
             })
             .join("");
 
-    const lobbyHtml = this.onlineRoomId
-      ? ""
-      : `
-        <div class="card">
-          <div class="card-header">
-            <h2 class="card-title">${t.onlineLobby}</h2>
-            <button class="btn" id="btn-refresh-lobby">${t.refresh}</button>
-          </div>
-          <div class="online-stack">
-            <div>
-              <div class="badge-muted" style="margin-bottom:5px;">${t.quickMatch}</div>
-              <div class="inline-row">
-                <button class="btn is-primary" data-matchmake="12+5">12+5</button>
-                <button class="btn is-primary" data-matchmake="5+3">5+3</button>
-                <button class="btn is-primary" data-matchmake="3+2">3+2</button>
+    const lobbyContentHtml = `
+      <div class="li-box-body online-stack">
+        ${
+          this.onlineRoomId
+            ? ""
+            : `
+              <div>
+                <div class="badge-muted" style="margin-bottom:5px;">${t.quickMatch}</div>
+                <div class="inline-row">
+                  <button type="button" class="li-btn is-sm is-green" data-matchmake="12+5">12+5</button>
+                  <button type="button" class="li-btn is-sm is-green" data-matchmake="5+3">5+3</button>
+                  <button type="button" class="li-btn is-sm is-green" data-matchmake="3+2">3+2</button>
+                </div>
               </div>
-            </div>
-            <div class="inline-row">
-              <select id="sel-online-tc">
-                ${["12+5", "5+3", "3+2", "unlimited"]
-                  .map(
-                    (tc) =>
-                      `<option value="${tc}" ${this.onlineTimeControl === tc ? "selected" : ""}>${
-                        tc === "unlimited" ? t.unlimited : tc
-                      }</option>`,
-                  )
-                  .join("")}
-              </select>
-              <button class="btn" id="btn-create-private">${t.createPrivate}</button>
-            </div>
-            <div class="inline-row">
-              <input id="inp-room-id" placeholder="${t.roomIdPlaceholder}" />
-              <button class="btn is-primary" id="btn-join-id">${t.joinRoom}</button>
-              <button class="btn" id="btn-watch-id">${t.watchRoom}</button>
-            </div>
-            <div class="badge-muted">${t.openRooms}</div>
-            <div class="room-list">${roomsHtml}</div>
-          </div>
+              <div class="inline-row">
+                <select class="li-select" id="sel-online-tc">
+                  ${["12+5", "5+3", "3+2", "unlimited"]
+                    .map(
+                      (tc) =>
+                        `<option value="${tc}" ${this.onlineTimeControl === tc ? "selected" : ""}>${
+                          tc === "unlimited" ? t.unlimited : tc
+                        }</option>`,
+                    )
+                    .join("")}
+                </select>
+                <button type="button" class="li-btn is-sm" id="btn-create-private">${t.createPrivate}</button>
+              </div>
+              <div class="inline-row">
+                <input class="li-input" id="inp-room-id" placeholder="${t.roomIdPlaceholder}" />
+                <button type="button" class="li-btn is-sm is-primary" id="btn-join-id">${t.joinRoom}</button>
+                <button type="button" class="li-btn is-sm" id="btn-watch-id">${t.watchRoom}</button>
+              </div>
+            `
+        }
+        <div class="inline-row" style="justify-content:space-between;">
+          <span class="badge-muted">${t.openRooms}</span>
+          <button type="button" class="li-btn is-sm" id="btn-refresh-lobby">${ICONS.refresh} <span>${t.refresh}</span></button>
         </div>
-      `;
+      </div>
+      <div class="room-list">${roomsHtml}</div>
+    `;
 
     const lbHtml =
       this.leaderboardPlayers.length === 0
-        ? `<div class="badge-muted">${t.noGamesYet}</div>`
-        : this.leaderboardPlayers
-            .slice(0, 10)
-            .map(
-              (p, idx) => `
-              <div class="table-row">
-                <span>#${idx + 1} <strong>${escapeHtml(p.username)}</strong></span>
-                <span class="badge-muted">${Math.round(p.rating)} (${p.wins}-${p.losses}-${p.draws})</span>
-              </div>
-            `,
-            )
-            .join("");
+        ? `<div class="li-box-body badge-muted">${t.noGamesYet}</div>`
+        : `<div class="compact-table">
+            ${this.leaderboardPlayers
+              .slice(0, 10)
+              .map(
+                (p, idx) => `
+                  <div class="table-row">
+                    <span>#${idx + 1} <strong>${escapeHtml(p.username)}</strong></span>
+                    <span class="badge-muted">${Math.round(p.rating)} (${p.wins}-${p.losses}-${p.draws})</span>
+                  </div>
+                `,
+              )
+              .join("")}
+          </div>`;
 
     const gamesHtml =
       this.recentGames.length === 0
-        ? `<div class="badge-muted">${t.noGamesYet}</div>`
-        : this.recentGames
-            .slice(0, 8)
-            .map(
-              (g) => `
-              <div class="table-row">
-                <div class="room-meta">
-                  <span class="room-players">${escapeHtml(g.light_name)} vs ${escapeHtml(g.dark_name)} (${escapeHtml(g.result)})</span>
-                  <span class="room-sub">${escapeHtml(g.time_control)} • ${g.moves_count} plies • ${escapeHtml(g.reason)}</span>
-                </div>
-                <button class="btn" data-analyze-game="${escapeHtml(g.id)}">${t.analyzeGame}</button>
-              </div>
-            `,
-            )
-            .join("");
+        ? `<div class="li-box-body badge-muted">${t.noGamesYet}</div>`
+        : `<div class="compact-table">
+            ${this.recentGames
+              .slice(0, 8)
+              .map(
+                (g) => `
+                  <div class="table-row">
+                    <div class="room-meta">
+                      <span class="room-players">${escapeHtml(g.light_name)} vs ${escapeHtml(g.dark_name)} (${escapeHtml(g.result)})</span>
+                      <span class="room-sub">${escapeHtml(g.time_control)} • ${g.moves_count} plies • ${escapeHtml(g.reason)}</span>
+                    </div>
+                    <button type="button" class="li-btn is-sm" data-analyze-game="${escapeHtml(g.id)}">${t.analyzeGame}</button>
+                  </div>
+                `,
+              )
+              .join("")}
+          </div>`;
+
+    const tabBody =
+      this.onlineSubTab === "lobby"
+        ? lobbyContentHtml
+        : this.onlineSubTab === "leaderboard"
+          ? lbHtml
+          : gamesHtml;
 
     this.onlinePanelEl.innerHTML = `
       ${alertHtml}
       ${inviteHtml}
       ${accountHtml}
-      ${lobbyHtml}
-      <div class="card">
-        <div class="card-header"><h2 class="card-title">${t.leaderboard}</h2></div>
-        <div class="compact-table">${lbHtml}</div>
-      </div>
-      <div class="card">
-        <div class="card-header"><h2 class="card-title">${t.recentGames}</h2></div>
-        <div class="compact-table">${gamesHtml}</div>
+      <div class="li-box">
+        <div class="li-tabs" role="tablist">
+          <button type="button" role="tab" aria-selected="${this.onlineSubTab === "lobby"}" class="li-tab ${this.onlineSubTab === "lobby" ? "is-active" : ""}" data-online-tab="lobby">${t.tabLobby}</button>
+          <button type="button" role="tab" aria-selected="${this.onlineSubTab === "leaderboard"}" class="li-tab ${this.onlineSubTab === "leaderboard" ? "is-active" : ""}" data-online-tab="leaderboard">${t.tabLeaderboard}</button>
+          <button type="button" role="tab" aria-selected="${this.onlineSubTab === "recent"}" class="li-tab ${this.onlineSubTab === "recent" ? "is-active" : ""}" data-online-tab="recent">${t.tabRecentGames}</button>
+        </div>
+        ${tabBody}
       </div>
     `;
 
@@ -1416,6 +2107,15 @@ class LimakhosApp {
   private bindOnlinePanelEvents(): void {
     const panel = this.onlinePanelEl;
     if (!panel) return;
+
+    panel.querySelectorAll<HTMLButtonElement>("[data-online-tab]").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const next = btn.dataset.onlineTab as "lobby" | "leaderboard" | "recent";
+        if (next !== "lobby" && next !== "leaderboard" && next !== "recent") return;
+        this.onlineSubTab = next;
+        this.renderOnlinePanel();
+      });
+    });
 
     panel.querySelector("#btn-copy-invite")?.addEventListener("click", () => {
       if (!this.onlineRoomId) return;
@@ -1435,6 +2135,7 @@ class LimakhosApp {
     panel.querySelector<HTMLInputElement>("#inp-guest-name")?.addEventListener("input", (ev) => {
       this.guestName = (ev.target as HTMLInputElement).value.trim() || "Guest";
       localStorage.setItem(LS_GUEST_KEY, this.guestName);
+      this.renderUserChip();
     });
 
     const getCreds = () => ({
@@ -1501,9 +2202,12 @@ class LimakhosApp {
   }
 
   private renderEvalBar(): void {
+    const showEval = this.shouldShowEvalBar();
+    this.boardStageEl.classList.toggle("no-eval", !showEval);
+
     const topLine = this.lastAnalysis?.lines[0];
     const snap = this.currentSnapshot;
-    if (!this.analysisEnabled || !topLine || !snap) {
+    if (!showEval || !topLine || !snap) {
       this.evalFill.style.height = "50%";
       this.evalTopLabel.textContent = "0.0";
       this.evalBottomLabel.textContent = "";
@@ -1536,85 +2240,211 @@ class LimakhosApp {
     this.analysisPanelEl.style.display = "";
 
     const t = this.t();
+    const maxHw =
+      typeof navigator !== "undefined" && navigator.hardwareConcurrency
+        ? Math.max(1, Math.min(16, navigator.hardwareConcurrency))
+        : 8;
+    if (this.analysisThreads > maxHw) {
+      this.analysisThreads = maxHw;
+    }
+    const timeIdx = timeMsToSliderIndex(this.analysisTimeMs);
+
+    if (!this.analysisPanelEl.querySelector("#engine-controls-slot")) {
+      this.analysisPanelEl.innerHTML = `
+        <div class="engine-head">
+          <div class="engine-head-left" id="engine-head-left"></div>
+          <div class="engine-head-right">
+            <button
+              type="button"
+              role="switch"
+              aria-checked="${this.analysisEnabled}"
+              class="li-switch ${this.analysisEnabled ? "is-on" : ""}"
+              id="btn-toggle-engine"
+              title="${escapeHtml(this.analysisEnabled ? t.engineOn : t.engineOff)}"
+            ></button>
+          </div>
+        </div>
+        <div class="engine-stats" id="engine-stats-slot"></div>
+        <div class="engine-controls" id="engine-controls-slot">
+          <div class="engine-slider-row">
+            <label for="inp-threads">${escapeHtml(t.maxThreads)}</label>
+            <input id="inp-threads" type="range" class="li-slider" min="1" max="${maxHw}" step="1" value="${this.analysisThreads}" />
+            <span class="engine-slider-val" id="val-threads">${this.analysisThreads}</span>
+          </div>
+          <div class="engine-slider-row">
+            <label for="inp-depth">${escapeHtml(t.maxDepthLabel)}</label>
+            <input id="inp-depth" type="range" class="li-slider" min="1" max="24" step="1" value="${this.analysisDepth}" />
+            <span class="engine-slider-val" id="val-depth">${this.analysisDepth}</span>
+          </div>
+          <div class="engine-slider-row">
+            <label for="inp-time-ms">${escapeHtml(t.maxTimeMsLabel)}</label>
+            <input id="inp-time-ms" type="range" class="li-slider" min="0" max="${ANALYSIS_TIME_STEPS_MS.length - 1}" step="1" value="${timeIdx}" />
+            <span class="engine-slider-val" id="val-time-ms">${escapeHtml(formatAnalysisTime(this.analysisTimeMs))}</span>
+          </div>
+        </div>
+        <div class="pv-list" id="pv-list-slot"></div>
+      `;
+
+      this.analysisPanelEl.querySelector("#btn-toggle-engine")?.addEventListener("click", () => {
+        this.analysisEnabled = !this.analysisEnabled;
+        if (!this.analysisEnabled) {
+          this.cancelAnalysis();
+        }
+        this.board.setArrows(this.computeBoardArrows());
+        this.renderEvalBar();
+        this.renderAnalysisPanel();
+        if (this.analysisEnabled) void this.triggerAnalysisIfEnabled();
+      });
+
+      const threadsInput = this.analysisPanelEl.querySelector<HTMLInputElement>("#inp-threads");
+      const threadsVal = this.analysisPanelEl.querySelector<HTMLElement>("#val-threads");
+      threadsInput?.addEventListener("input", () => {
+        const val = Math.max(1, Math.min(maxHw, Math.round(Number(threadsInput.value) || 1)));
+        this.analysisThreads = val;
+        if (threadsVal) threadsVal.textContent = String(val);
+      });
+      threadsInput?.addEventListener("change", () => {
+        const val = Math.max(1, Math.min(maxHw, Math.round(Number(threadsInput.value) || 1)));
+        this.analysisThreads = val;
+        if (threadsVal) threadsVal.textContent = String(val);
+        if (this.analysisEnabled) void this.triggerAnalysisIfEnabled();
+      });
+
+      const depthInput = this.analysisPanelEl.querySelector<HTMLInputElement>("#inp-depth");
+      const depthVal = this.analysisPanelEl.querySelector<HTMLElement>("#val-depth");
+      depthInput?.addEventListener("input", () => {
+        const val = Math.max(1, Math.min(24, Math.round(Number(depthInput.value) || 1)));
+        this.analysisDepth = val;
+        if (depthVal) depthVal.textContent = String(val);
+      });
+      depthInput?.addEventListener("change", () => {
+        const val = Math.max(1, Math.min(24, Math.round(Number(depthInput.value) || 1)));
+        this.analysisDepth = val;
+        if (depthVal) depthVal.textContent = String(val);
+        if (this.analysisEnabled) void this.triggerAnalysisIfEnabled();
+      });
+
+      const timeInput = this.analysisPanelEl.querySelector<HTMLInputElement>("#inp-time-ms");
+      const timeVal = this.analysisPanelEl.querySelector<HTMLElement>("#val-time-ms");
+      const readSliderTime = () => {
+        const idx = Math.max(
+          0,
+          Math.min(ANALYSIS_TIME_STEPS_MS.length - 1, Math.round(Number(timeInput?.value) || 0)),
+        );
+        return ANALYSIS_TIME_STEPS_MS[idx] ?? 1500;
+      };
+      timeInput?.addEventListener("input", () => {
+        this.analysisTimeMs = readSliderTime();
+        if (timeVal) timeVal.textContent = formatAnalysisTime(this.analysisTimeMs);
+      });
+      timeInput?.addEventListener("change", () => {
+        this.analysisTimeMs = readSliderTime();
+        if (timeVal) timeVal.textContent = formatAnalysisTime(this.analysisTimeMs);
+        if (this.analysisEnabled) void this.triggerAnalysisIfEnabled();
+      });
+    }
+
     const snap = this.currentSnapshot;
     const res = this.lastAnalysis;
+    const topLine = res?.lines[0];
     const nps = res && this.lastAnalysisMs > 0 ? Math.round((res.nodes * 1000) / this.lastAnalysisMs) : 0;
 
-    const linesHtml =
-      this.analysisEnabled && res && snap && res.lines.length > 0
-        ? res.lines
-            .map((line) => {
-              const badge = formatEvalLight(line.score_light_cp, line.mate_in, snap.side_to_move);
-              const scoreCls = line.score_light_cp >= 0 ? "is-light" : "is-dark";
-              const bestToken = line.pv_notations[0] ?? "";
-              return `
-                <button class="pv-row" data-pv-move="${bestToken}">
-                  <span class="pv-score ${scoreCls}">${badge}</span>
-                  <span class="pv-line">${line.pv_notations.join("  ")}</span>
-                </button>
-              `;
-            })
-            .join("")
-        : `<div style="color:var(--muted);font-size:0.84rem;">${
-            this.analysisEnabled ? (this.analysisBusy ? t.engineThinking : "—") : t.engineOff
-          }</div>`;
+    const evalText =
+      this.analysisEnabled && topLine && snap
+        ? formatEvalLight(topLine.score_light_cp, topLine.mate_in, snap.side_to_move)
+        : this.analysisEnabled
+          ? "…"
+          : "—";
 
-    this.analysisPanelEl.innerHTML = `
-      <div class="card-header">
-        <h2 class="card-title">${t.engineAnalysis}</h2>
-        <div style="display:flex;gap:6px;align-items:center;">
-          <select id="sel-depth" class="btn" style="padding:3px 6px;">
-            ${[5, 6, 8, 10, 12]
-              .map((d) => `<option value="${d}" ${this.analysisDepth === d ? "selected" : ""}>D${d}</option>`)
-              .join("")}
-          </select>
-          <button class="btn ${this.analysisEnabled ? "is-active" : ""}" id="btn-toggle-engine">
-            ${this.analysisEnabled ? t.engineOn : t.engineOff}
-          </button>
-        </div>
-      </div>
-      ${
-        this.analysisEnabled && res
-          ? `<div class="analysis-meta">
-               <span>${t.depth}: ${res.depth}</span>
-               <span>${t.nodes}: ${res.nodes.toLocaleString()}</span>
-               <span>${t.nps}: ${nps.toLocaleString()}</span>
-             </div>`
-          : ""
+    const metaText = !this.analysisEnabled
+      ? t.engineOff
+      : this.analysisBusy
+        ? res && res.depth > 0
+          ? `d${res.depth}/${this.analysisDepth} • ${this.analysisThreads}T • ${t.engineThinking}`
+          : t.engineThinking
+        : res
+          ? `d${res.depth}/${this.analysisDepth} • ${this.analysisThreads}T`
+          : t.engineAnalysis;
+
+    const headLeftEl = this.analysisPanelEl.querySelector<HTMLElement>("#engine-head-left");
+    if (headLeftEl) {
+      headLeftEl.innerHTML = `
+        <span class="engine-eval-big">${escapeHtml(evalText)}</span>
+        <span class="engine-meta">${escapeHtml(metaText)}</span>
+      `;
+    }
+
+    const toggleBtn = this.analysisPanelEl.querySelector<HTMLButtonElement>("#btn-toggle-engine");
+    if (toggleBtn) {
+      toggleBtn.classList.toggle("is-on", this.analysisEnabled);
+      toggleBtn.setAttribute("aria-checked", String(this.analysisEnabled));
+      toggleBtn.title = this.analysisEnabled ? t.engineOn : t.engineOff;
+    }
+
+    const statsEl = this.analysisPanelEl.querySelector<HTMLElement>("#engine-stats-slot");
+    const controlsEl = this.analysisPanelEl.querySelector<HTMLElement>("#engine-controls-slot");
+    const pvListEl = this.analysisPanelEl.querySelector<HTMLElement>("#pv-list-slot");
+
+    if (controlsEl) {
+      controlsEl.hidden = !this.analysisEnabled;
+    }
+
+    if (statsEl) {
+      statsEl.hidden = !this.analysisEnabled;
+      if (this.analysisEnabled) {
+        const nodesText = res ? res.nodes.toLocaleString() : "0";
+        const npsText = res ? nps.toLocaleString() : "0";
+        const depthText = res ? `${res.depth}/${this.analysisDepth}` : `0/${this.analysisDepth}`;
+        const timeText = res && this.lastAnalysisMs > 0 ? formatElapsedMs(this.lastAnalysisMs) : "—";
+        statsEl.innerHTML = `
+          <span>${escapeHtml(t.depth)}: <strong>${depthText}</strong></span>
+          <span><strong>${nodesText}</strong> ${escapeHtml(t.nodesExplored)}</span>
+          <span><strong>${npsText}</strong> ${escapeHtml(t.nps)}</span>
+          <span><strong>${timeText}</strong></span>
+        `;
       }
-      <div class="pv-list">${linesHtml}</div>
-    `;
+    }
 
-    this.analysisPanelEl.querySelector("#btn-toggle-engine")?.addEventListener("click", () => {
-      this.analysisEnabled = !this.analysisEnabled;
-      this.syncBoard();
-      this.renderEvalBar();
-      this.renderAnalysisPanel();
-      if (this.analysisEnabled) void this.triggerAnalysisIfEnabled();
-    });
+    if (pvListEl) {
+      pvListEl.innerHTML =
+        this.analysisEnabled && res && snap && res.lines.length > 0
+          ? res.lines
+              .map((line) => {
+                const badge = formatEvalLight(line.score_light_cp, line.mate_in, snap.side_to_move);
+                const scoreCls = line.score_light_cp >= 0 ? "is-light" : "is-dark";
+                const bestToken = line.pv_notations[0] ?? "";
+                return `
+                  <button type="button" class="pv-row" data-pv-move="${escapeHtml(bestToken)}">
+                    <span class="pv-score ${scoreCls}">${badge}</span>
+                    <span class="pv-line">${escapeHtml(line.pv_notations.join("  "))}</span>
+                  </button>
+                `;
+              })
+              .join("")
+          : `<div style="padding:8px 10px;color:var(--text-muted);font-size:0.8rem;border-top:1px solid var(--border-subtle);">${
+              this.analysisEnabled ? (this.analysisBusy ? t.engineThinking : "—") : t.engineOff
+            }</div>`;
 
-    this.analysisPanelEl.querySelector<HTMLSelectElement>("#sel-depth")?.addEventListener("change", (ev) => {
-      this.analysisDepth = Number((ev.target as HTMLSelectElement).value);
-      void this.triggerAnalysisIfEnabled();
-    });
-
-    this.analysisPanelEl.querySelectorAll<HTMLButtonElement>("[data-pv-move]").forEach((btn) => {
-      btn.addEventListener("click", () => {
-        const tok = btn.dataset.pvMove;
-        if (tok && this.canHumanMoveNow()) {
-          void this.commitNotation(tok);
-        }
+      pvListEl.querySelectorAll<HTMLButtonElement>("[data-pv-move]").forEach((btn) => {
+        btn.addEventListener("click", () => {
+          const tok = btn.dataset.pvMove;
+          if (tok && this.canHumanMoveNow()) {
+            void this.commitNotation(tok);
+          }
+        });
       });
-    });
+    }
   }
 
   private async loadOpeningLine(lineId: string): Promise<void> {
     const line = OPENING_BOOK.find((l) => l.id === lineId);
     if (!line) return;
-    await this.engine.clearCache();
+    this.cancelAnalysis();
+    void this.engine.clearCache();
     this.stopClock();
     this.forcedOutcome = null;
     this.lastAnalysis = null;
+    this.lastAnalysisMs = 0;
 
     const startSnap = await this.engine.inspect();
     const timeline: HistoryEntry[] = [
@@ -1650,7 +2480,6 @@ class LimakhosApp {
     const t = this.t();
     const isTh = this.locale === "th";
 
-    // Only match book when playing from standard starting position
     const startFen = this.timeline[0]?.fen ?? "";
     const startDefault =
       startFen.startsWith("W:W1,2,3,4,5,6,7,8:B25,26,27,28,29,30,31,32");
@@ -1679,14 +2508,17 @@ class LimakhosApp {
 
     const formationHtml = `
       <div class="opening-formation-box">
-        ${formationTitle ? `<div class="opening-formation-title">${escapeHtml(formationTitle)}</div>` : ""}
+        <div class="status-strip-row" style="margin-bottom:3px;">
+          <span class="opening-formation-title" style="margin:0;">${escapeHtml(formationTitle ?? t.openingExplorer)}</span>
+          <span class="li-badge">${match.matchingLines.length} ${t.openingLinesCount}</span>
+        </div>
         <div class="opening-note">${escapeHtml(noteText)}</div>
       </div>
     `;
 
     const movesHtml =
       match.nextMoves.length > 0
-        ? `<div class="book-move-list">
+        ? `<div>
             ${match.nextMoves
               .map((bm) => {
                 const topLine = bm.lines[0];
@@ -1696,10 +2528,10 @@ class LimakhosApp {
                     : `${topLine.nameEn} • ${topLine.variationEn}`
                   : "";
                 return `
-                  <button class="book-move-btn" data-book-move="${escapeHtml(bm.notation)}">
-                    <span class="book-move-not">${escapeHtml(bm.notation)}</span>
-                    <span class="book-move-sub">${escapeHtml(label)}</span>
-                    <span class="badge-muted">${bm.lineCount} ${t.openingLinesCount}</span>
+                  <button type="button" class="book-row" data-book-move="${escapeHtml(bm.notation)}">
+                    <span class="book-not">${escapeHtml(bm.notation)}</span>
+                    <span class="book-name">${escapeHtml(label)}</span>
+                    <span class="book-count">${bm.lineCount} ${t.openingLinesCount}</span>
                   </button>
                 `;
               })
@@ -1712,7 +2544,7 @@ class LimakhosApp {
         ${FORMATIONS.map((f) => {
           const firstLine = OPENING_BOOK.find((l) => l.formationId === f.id);
           const isActive = match.matchedFormation?.id === f.id;
-          return `<button class="formation-chip ${isActive ? "is-active" : ""}" data-formation-line="${escapeHtml(
+          return `<button type="button" class="formation-chip ${isActive ? "is-active" : ""}" data-formation-line="${escapeHtml(
             firstLine?.id ?? "",
           )}">${escapeHtml(isTh ? f.nameTh : f.nameEn)}</button>`;
         }).join("")}
@@ -1720,10 +2552,6 @@ class LimakhosApp {
     `;
 
     this.openingPanelEl.innerHTML = `
-      <div class="card-header">
-        <h2 class="card-title">${t.openingExplorer}</h2>
-        <span class="badge-muted">${match.matchingLines.length} ${t.openingLinesCount}</span>
-      </div>
       ${formationHtml}
       ${movesHtml}
       ${chipsHtml}
@@ -1749,9 +2577,10 @@ class LimakhosApp {
   private renderMovesPanel(): void {
     const t = this.t();
     const moves = this.timeline.slice(1);
-    let rowsHtml = "";
+    let tableInnerHtml = "";
     if (moves.length === 0) {
-      rowsHtml = `<div style="grid-column:1/-1;color:var(--muted);padding:4px 0;">${t.noMovesYet}</div>`;
+      const emptyMsg = this.timeline[0]?.fen.startsWith("B:") ? t.noMovesYetDark : t.noMovesYet;
+      tableInnerHtml = `<div class="moves-empty">${escapeHtml(emptyMsg)}</div>`;
     } else {
       for (let i = 0; i < moves.length; i += 2) {
         const moveNum = Math.floor(i / 2) + 1;
@@ -1759,29 +2588,21 @@ class LimakhosApp {
         const darkPly = i + 2;
         const lightTok = moves[i]?.notation ?? "";
         const darkTok = moves[i + 1]?.notation ?? "";
-        rowsHtml += `
+        tableInnerHtml += `
           <span class="move-num">${moveNum}.</span>
-          <button class="move-cell ${this.cursor === lightPly ? "is-current" : ""}" data-ply="${lightPly}">${lightTok}</button>
+          <button type="button" class="move-cell ${this.cursor === lightPly ? "is-current" : ""}" data-ply="${lightPly}">${escapeHtml(lightTok)}</button>
           ${
             darkTok
-              ? `<button class="move-cell ${this.cursor === darkPly ? "is-current" : ""}" data-ply="${darkPly}">${darkTok}</button>`
-              : `<span></span>`
+              ? `<button type="button" class="move-cell ${this.cursor === darkPly ? "is-current" : ""}" data-ply="${darkPly}">${escapeHtml(darkTok)}</button>`
+              : `<span class="move-cell"></span>`
           }
         `;
       }
     }
 
     this.movesPanelEl.innerHTML = `
-      <div class="card-header">
-        <h2 class="card-title">${t.movesHistory}</h2>
-        <span style="font-size:0.78rem;color:var(--muted);">${this.cursor}/${this.timeline.length - 1}</span>
-      </div>
-      <div class="moves-list">${rowsHtml}</div>
-      <div class="nav-row">
-        <button class="btn" id="nav-start" ${this.cursor === 0 ? "disabled" : ""}>|&lt;</button>
-        <button class="btn" id="nav-prev" ${this.cursor === 0 ? "disabled" : ""}>&lt;</button>
-        <button class="btn" id="nav-next" ${this.cursor >= this.timeline.length - 1 ? "disabled" : ""}>&gt;</button>
-        <button class="btn" id="nav-end" ${this.cursor >= this.timeline.length - 1 ? "disabled" : ""}>&gt;|</button>
+      <div class="moves-wrap">
+        <div class="moves-table">${tableInnerHtml}</div>
       </div>
     `;
 
@@ -1792,26 +2613,30 @@ class LimakhosApp {
       });
     });
 
-    this.movesPanelEl.querySelector("#nav-start")?.addEventListener("click", () => {
-      this.cursor = 0;
-      void this.inspectCursor();
-    });
-    this.movesPanelEl.querySelector("#nav-prev")?.addEventListener("click", () => {
-      if (this.cursor > 0) {
-        this.cursor -= 1;
-        void this.inspectCursor();
+    // Update replay bar disabled states
+    const atStart = this.cursor === 0;
+    const atEnd = this.cursor >= this.timeline.length - 1;
+    const navStart = this.root.querySelector<HTMLButtonElement>("#nav-start");
+    const navPrev = this.root.querySelector<HTMLButtonElement>("#nav-prev");
+    const navNext = this.root.querySelector<HTMLButtonElement>("#nav-next");
+    const navEnd = this.root.querySelector<HTMLButtonElement>("#nav-end");
+    if (navStart) navStart.disabled = atStart;
+    if (navPrev) navPrev.disabled = atStart;
+    if (navNext) navNext.disabled = atEnd;
+    if (navEnd) navEnd.disabled = atEnd;
+
+    // Auto-scroll current move inside .moves-wrap only (never jumps outer page)
+    const wrap = this.movesPanelEl.querySelector<HTMLElement>(".moves-wrap");
+    const currentCell = wrap?.querySelector<HTMLElement>(".move-cell.is-current");
+    if (wrap && currentCell) {
+      const wrapRect = wrap.getBoundingClientRect();
+      const cellRect = currentCell.getBoundingClientRect();
+      if (cellRect.top < wrapRect.top) {
+        wrap.scrollTop -= wrapRect.top - cellRect.top + 4;
+      } else if (cellRect.bottom > wrapRect.bottom) {
+        wrap.scrollTop += cellRect.bottom - wrapRect.bottom + 4;
       }
-    });
-    this.movesPanelEl.querySelector("#nav-next")?.addEventListener("click", () => {
-      if (this.cursor < this.timeline.length - 1) {
-        this.cursor += 1;
-        void this.inspectCursor();
-      }
-    });
-    this.movesPanelEl.querySelector("#nav-end")?.addEventListener("click", () => {
-      this.cursor = this.timeline.length - 1;
-      void this.inspectCursor();
-    });
+    }
   }
 
   // --- Puzzles & Practice (100% offline WASM) ---
@@ -1848,9 +2673,11 @@ class LimakhosApp {
     const seq = ++this.puzzleRunSeq;
 
     this.stopClock();
+    this.cancelAnalysis();
     this.forcedOutcome = null;
     this.aiThinking = false;
     this.lastAnalysis = null;
+    this.lastAnalysisMs = 0;
 
     const puzzle = this.activePuzzle();
     const snap = await this.engine.inspect(puzzle.fen);
@@ -1900,7 +2727,6 @@ class LimakhosApp {
       return;
     }
 
-    // Auto-play opponent's forced reply along the solution line
     this.aiThinking = true;
     this.syncBoard();
     this.renderStudyPanel();
@@ -1951,7 +2777,7 @@ class LimakhosApp {
         from: match.from,
         to: match.to,
         path: match.path,
-        color: "#f59e0b",
+        color: "#e68f00",
         opacity: 0.9,
         width: 14,
       };
@@ -1969,7 +2795,6 @@ class LimakhosApp {
     this.aiThinking = false;
     const seq = ++this.puzzleRunSeq;
 
-    // Replay from puzzle start so solution is cleanly visible in move history
     const startSnap = await this.engine.inspect(puzzle.fen);
     if (seq !== this.puzzleRunSeq || this.mode !== "puzzles") return;
     const timeline: HistoryEntry[] = [
@@ -2021,24 +2846,32 @@ class LimakhosApp {
   private async showPracticeHint(): Promise<void> {
     if (!this.currentSnapshot || this.mode !== "practice") return;
     const fen = this.currentSnapshot.fen;
-    const res = await this.engine.analyze(fen, {
-      maxDepth: 6,
-      maxNodes: 150_000,
-      multipv: 1,
-      historyHashes: this.historyHashesUpTo(this.cursor),
-    });
-    if (this.currentSnapshot?.fen !== fen || this.mode !== "practice") return;
-    const top = res.lines[0];
+    let top = this.lastAnalysis?.lines[0];
+    if (!top) {
+      try {
+        const res = await this.engine.analyze(fen, {
+          maxDepth: 6,
+          maxNodes: 150_000,
+          multipv: 1,
+          historyHashes: this.historyHashesUpTo(this.cursor),
+        });
+        if (this.currentSnapshot?.fen !== fen || this.mode !== "practice") return;
+        top = res.lines[0];
+      } catch (err) {
+        if (err instanceof AnalysisCancelledError) return;
+        throw err;
+      }
+    }
     if (top) {
       this.practiceHintArrow = {
         from: top.best_move.from,
         to: top.best_move.to,
         path: top.best_move.path,
-        color: "#22c55e",
+        color: "#15781B",
         opacity: 0.9,
         width: 14,
       };
-      this.syncBoard();
+      this.board.setArrows(this.computeBoardArrows());
     }
   }
 
@@ -2068,7 +2901,7 @@ class LimakhosApp {
         const done = this.studyProgress.solvedPuzzles.includes(p.id);
         const active = idx === this.activePuzzleIdx;
         return `
-          <button class="study-item ${active ? "is-active" : ""} ${done ? "is-done" : ""}" data-puzzle-idx="${idx}">
+          <button type="button" class="study-item ${active ? "is-active" : ""} ${done ? "is-done" : ""}" data-puzzle-idx="${idx}">
             <span>${done ? "✓ " : ""}#${idx + 1} ${escapeHtml(isTh ? p.titleTh : p.titleEn)}</span>
             <span class="badge-muted">${p.rating}</span>
           </button>
@@ -2076,26 +2909,28 @@ class LimakhosApp {
       }).join("");
 
       this.studyPanelEl.innerHTML = `
-        <div class="card">
-          <div class="card-header">
-            <h2 class="card-title">${t.puzzleTitle}</h2>
-            <span class="pill">${t.puzzleRating}: ${this.studyProgress.puzzleRating}</span>
+        <div class="li-box">
+          <div class="li-box-header">
+            <h2 class="li-box-title">${t.puzzleTitle}</h2>
+            <span class="li-badge is-accent">${t.puzzleRating}: ${this.studyProgress.puzzleRating}</span>
           </div>
-          <div class="inline-row" style="justify-content:space-between;margin-bottom:8px;">
-            <strong>${isSolved ? "✓ " : ""}${escapeHtml(isTh ? puzzle.titleTh : puzzle.titleEn)}</strong>
-            <span class="pill">${escapeHtml(isTh ? puzzle.themeTh : puzzle.themeEn)} • ${puzzle.rating}</span>
-          </div>
-          ${feedbackHtml}
-          <div class="inline-row">
-            <button class="btn" id="btn-puzzle-hint">${t.puzzleHint}</button>
-            <button class="btn" id="btn-puzzle-reveal">${t.puzzleShowSolution}</button>
-            <button class="btn" id="btn-puzzle-retry">${t.puzzleRetry}</button>
-            <button class="btn is-primary" id="btn-puzzle-next">${t.puzzleNext}</button>
+          <div class="li-box-body">
+            <div class="inline-row" style="justify-content:space-between;margin-bottom:8px;">
+              <strong>${isSolved ? "✓ " : ""}${escapeHtml(isTh ? puzzle.titleTh : puzzle.titleEn)}</strong>
+              <span class="li-badge">${escapeHtml(isTh ? puzzle.themeTh : puzzle.themeEn)} • ${puzzle.rating}</span>
+            </div>
+            ${feedbackHtml}
+            <div class="inline-row">
+              <button type="button" class="li-btn is-sm" id="btn-puzzle-hint">${ICONS.hint} <span>${t.puzzleHint}</span></button>
+              <button type="button" class="li-btn is-sm" id="btn-puzzle-reveal">${ICONS.eye} <span>${t.puzzleShowSolution}</span></button>
+              <button type="button" class="li-btn is-sm" id="btn-puzzle-retry">${t.puzzleRetry}</button>
+              <button type="button" class="li-btn is-sm is-primary" id="btn-puzzle-next">${t.puzzleNext}</button>
+            </div>
           </div>
         </div>
-        <div class="card">
-          <div class="card-header">
-            <h2 class="card-title">${t.puzzleSolvedCount}: ${this.studyProgress.solvedPuzzles.length}/${KON_MAKHOS_PUZZLES.length}</h2>
+        <div class="li-box">
+          <div class="li-box-header">
+            <h2 class="li-box-title">${t.puzzleSolvedCount}: ${this.studyProgress.solvedPuzzles.length}/${KON_MAKHOS_PUZZLES.length}</h2>
           </div>
           <div class="study-list">${listHtml}</div>
         </div>
@@ -2123,7 +2958,6 @@ class LimakhosApp {
       const mod = this.activePracticeModule();
       const drill = this.activePracticeDrill();
       const outcome = this.effectiveOutcome();
-      const drillDone = this.studyProgress.completedDrills.includes(drill.id);
 
       let bannerHtml = `<div class="study-feedback">${escapeHtml(isTh ? drill.goalTh : drill.goalEn)}</div>`;
       if (outcome.type === "win" && outcome.winner === drill.humanColor) {
@@ -2134,7 +2968,7 @@ class LimakhosApp {
 
       const modulesHtml = PRACTICE_MODULES.map((m, idx) => {
         const active = idx === this.activeModuleIdx;
-        return `<button class="module-tab ${active ? "is-active" : ""}" data-mod-idx="${idx}">${escapeHtml(
+        return `<button type="button" class="module-tab ${active ? "is-active" : ""}" data-mod-idx="${idx}">${escapeHtml(
           isTh ? m.titleTh : m.titleEn,
         )}</button>`;
       }).join("");
@@ -2144,7 +2978,7 @@ class LimakhosApp {
           const active = idx === this.activeDrillIdx;
           const done = this.studyProgress.completedDrills.includes(d.id);
           return `
-            <button class="study-item ${active ? "is-active" : ""} ${done ? "is-done" : ""}" data-drill-idx="${idx}">
+            <button type="button" class="study-item ${active ? "is-active" : ""} ${done ? "is-done" : ""}" data-drill-idx="${idx}">
               <span>${done ? "✓ " : ""}${escapeHtml(isTh ? d.titleTh : d.titleEn)}</span>
               <span class="badge-muted">AI L${d.aiLevel}</span>
             </button>
@@ -2153,23 +2987,24 @@ class LimakhosApp {
         .join("");
 
       this.studyPanelEl.innerHTML = `
-        <div class="card">
-          <div class="card-header">
-            <h2 class="card-title">${t.practiceTitle}</h2>
-            <span class="pill">${t.practiceCompleted}: ${this.studyProgress.completedDrills.length}/${PRACTICE_MODULES.reduce((s, m) => s + m.drills.length, 0)}</span>
+        <div class="li-box">
+          <div class="li-box-header">
+            <h2 class="li-box-title">${t.practiceTitle}</h2>
+            <span class="li-badge is-good">${t.practiceCompleted}: ${this.studyProgress.completedDrills.length}/${PRACTICE_MODULES.reduce((s, m) => s + m.drills.length, 0)}</span>
           </div>
-          <div class="module-tabs">${modulesHtml}</div>
-          <div class="opening-note" style="margin-bottom:8px;">${escapeHtml(
-            isTh ? mod.descriptionTh : mod.descriptionEn,
-          )}</div>
-          ${bannerHtml}
-          <div class="inline-row" style="margin-bottom:10px;">
-            <button class="btn is-primary" id="btn-practice-retry">${t.practiceRetry}</button>
-            <button class="btn" id="btn-practice-hint">${t.practiceHint}</button>
-            <button class="btn ${this.practiceLiveEval ? "is-active" : ""}" id="btn-practice-eval">Eval</button>
+          <div class="li-box-body">
+            <div class="module-tabs">${modulesHtml}</div>
+            <div class="opening-note" style="margin-bottom:8px;">${escapeHtml(
+              isTh ? mod.descriptionTh : mod.descriptionEn,
+            )}</div>
+            ${bannerHtml}
+            <div class="inline-row">
+              <button type="button" class="li-btn is-sm is-primary" id="btn-practice-retry">${t.practiceRetry}</button>
+              <button type="button" class="li-btn is-sm" id="btn-practice-hint">${ICONS.hint} <span>${t.practiceHint}</span></button>
+              <button type="button" class="li-btn is-sm ${this.practiceLiveEval ? "is-active" : ""}" id="btn-practice-eval">Eval</button>
+            </div>
           </div>
           <div class="study-list">${drillsHtml}</div>
-          ${drillDone ? "" : ""}
         </div>
       `;
 
@@ -2182,7 +3017,10 @@ class LimakhosApp {
       this.studyPanelEl.querySelector("#btn-practice-eval")?.addEventListener("click", () => {
         this.practiceLiveEval = !this.practiceLiveEval;
         this.analysisEnabled = this.practiceLiveEval;
-        this.syncBoard();
+        if (!this.analysisEnabled) {
+          this.cancelAnalysis();
+        }
+        this.board.setArrows(this.computeBoardArrows());
         this.renderEvalBar();
         this.renderAnalysisPanel();
         this.renderStudyPanel();

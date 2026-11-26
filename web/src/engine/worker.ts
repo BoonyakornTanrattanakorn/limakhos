@@ -7,29 +7,60 @@ interface WasmExports {
   wasm_dispatch: (ptr: number, len: number) => bigint;
 }
 
+type WorkerInbound =
+  | { type: "init"; module: WebAssembly.Module }
+  | { id: number; req: unknown };
+
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
 
+let precompiledModule: WebAssembly.Module | null = null;
+let wasmExports: WasmExports | null = null;
 let exportsPromise: Promise<WasmExports> | null = null;
+let activeRequestId: number | null = null;
+
+function buildImports(): WebAssembly.Imports {
+  return {
+    env: {
+      host_now_ms: () => performance.now(),
+      host_on_progress: (ptr: number, len: number) => {
+        if (activeRequestId === null || !wasmExports) return;
+        try {
+          const bytes = new Uint8Array(wasmExports.memory.buffer, ptr, len).slice();
+          const parsed = JSON.parse(decoder.decode(bytes));
+          self.postMessage({ id: activeRequestId, progress: parsed });
+        } catch {
+          // Ignore malformed progress ticks
+        }
+      },
+    },
+  };
+}
 
 async function loadWasm(): Promise<WasmExports> {
   if (!exportsPromise) {
     exportsPromise = (async () => {
-      const url = "/wasm/makhos_wasm.wasm";
+      const imports = buildImports();
       let instance: WebAssembly.Instance;
       try {
-        const res = await fetch(url);
-        if (!res.ok) {
-          throw new Error(`Failed to fetch ${url} (HTTP ${res.status})`);
+        if (precompiledModule) {
+          instance = await WebAssembly.instantiate(precompiledModule, imports);
+        } else {
+          const url = "/wasm/makhos_wasm.wasm";
+          const res = await fetch(url);
+          if (!res.ok) {
+            throw new Error(`Failed to fetch ${url} (HTTP ${res.status})`);
+          }
+          const bytes = await res.arrayBuffer();
+          const instantiated = await WebAssembly.instantiate(bytes, imports);
+          instance = instantiated.instance;
         }
-        const bytes = await res.arrayBuffer();
-        const instantiated = await WebAssembly.instantiate(bytes, {});
-        instance = instantiated.instance;
       } catch (err) {
         exportsPromise = null;
         throw err;
       }
-      return instance.exports as unknown as WasmExports;
+      wasmExports = instance.exports as unknown as WasmExports;
+      return wasmExports;
     })();
   }
   return exportsPromise;
@@ -51,14 +82,28 @@ function callDispatch(wasm: WasmExports, payload: string): string {
   return decoder.decode(respBytes);
 }
 
-self.onmessage = async (ev: MessageEvent<{ id: number; req: unknown }>) => {
-  const { id, req } = ev.data;
+self.onmessage = async (ev: MessageEvent<WorkerInbound>) => {
+  const data = ev.data;
+  if ("type" in data) {
+    precompiledModule = data.module;
+    void loadWasm().catch(() => {});
+    return;
+  }
+
+  const { id, req } = data;
   try {
     const wasm = await loadWasm();
-    const raw = callDispatch(wasm, JSON.stringify(req));
+    activeRequestId = id;
+    let raw: string;
+    try {
+      raw = callDispatch(wasm, JSON.stringify(req));
+    } finally {
+      activeRequestId = null;
+    }
     const parsed = JSON.parse(raw);
     self.postMessage({ id, resp: parsed });
   } catch (err) {
+    activeRequestId = null;
     const message = err instanceof Error ? err.message : String(err);
     self.postMessage({ id, resp: { ok: "error", message } });
   }

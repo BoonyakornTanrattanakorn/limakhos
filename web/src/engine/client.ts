@@ -1,4 +1,6 @@
 import type {
+  AnalysisLine,
+  AnalysisProgress,
   AnalysisResult,
   GameOutcome,
   MoveDto,
@@ -10,48 +12,178 @@ import type {
 interface PendingCall {
   resolve: (resp: WasmResponse) => void;
   reject: (err: Error) => void;
+  onProgress?: (progress: AnalysisProgress) => void;
+}
+
+interface WorkerSlot {
+  worker: Worker;
+  pending: Map<number, PendingCall>;
+}
+
+interface WorkerOutbound {
+  id: number;
+  resp?: WasmResponse;
+  progress?: AnalysisProgress;
+}
+
+export class AnalysisCancelledError extends Error {
+  constructor() {
+    super("Analysis cancelled");
+    this.name = "AnalysisCancelledError";
+  }
+}
+
+export interface AnalysisProgressUpdate {
+  depth: number;
+  nodes: number;
+  lines: AnalysisLine[];
+}
+
+export interface AnalyzeOptions {
+  maxDepth?: number;
+  maxNodes?: number;
+  maxTimeMs?: number;
+  threads?: number;
+  multipv?: number;
+  historyHashes?: string[];
+  legalMoves?: string[];
+  onProgress?: (update: AnalysisProgressUpdate) => void;
 }
 
 /**
  * Off-main-thread client for the local Rust WASM rules & analysis engine.
+ *
+ * Uses a dedicated interactive worker for fast rules operations (`inspect`, `applyMove`,
+ * PDN I/O, `aiMove`) so moving pieces and navigating history are NEVER blocked by
+ * background analysis, plus a separate preemptible Web Worker pool for streaming
+ * single- or multi-threaded analysis.
  */
 export class MakhosEngineClient {
-  private worker: Worker;
+  private rulesSlot: WorkerSlot | null = null;
+  private analysisSlots: WorkerSlot[] = [];
   private nextId = 1;
-  private pending = new Map<number, PendingCall>();
+  private activeAnalysisRunId = 0;
+  private compiledModule: WebAssembly.Module | null = null;
+  private compilePromise: Promise<WebAssembly.Module | null> | null = null;
 
   constructor() {
-    this.worker = new Worker(new URL("./worker.ts", import.meta.url), { type: "module" });
-    this.worker.onmessage = (ev: MessageEvent<{ id: number; resp: WasmResponse }>) => {
-      const { id, resp } = ev.data;
-      const entry = this.pending.get(id);
+    this.warmWasmModule();
+    this.ensureRulesSlot();
+  }
+
+  private warmWasmModule(): void {
+    if (this.compilePromise || typeof fetch !== "function" || typeof WebAssembly === "undefined") {
+      return;
+    }
+    this.compilePromise = (async () => {
+      try {
+        const res = await fetch("/wasm/makhos_wasm.wasm");
+        if (!res.ok) return null;
+        const bytes = await res.arrayBuffer();
+        const mod = await WebAssembly.compile(bytes);
+        this.compiledModule = mod;
+        return mod;
+      } catch {
+        return null;
+      }
+    })();
+  }
+
+  private createSlot(): WorkerSlot {
+    const worker = new Worker(new URL("./worker.ts", import.meta.url), { type: "module" });
+    const pending = new Map<number, PendingCall>();
+    const slot: WorkerSlot = { worker, pending };
+
+    if (this.compiledModule) {
+      try {
+        worker.postMessage({ type: "init", module: this.compiledModule });
+      } catch {
+        // Fallback to worker fetch
+      }
+    }
+
+    worker.onmessage = (ev: MessageEvent<WorkerOutbound>) => {
+      const { id, resp, progress } = ev.data;
+      const entry = pending.get(id);
       if (!entry) return;
-      this.pending.delete(id);
+      if (progress) {
+        entry.onProgress?.(progress);
+        return;
+      }
+      if (!resp) return;
+      pending.delete(id);
       if (resp.ok === "error") {
         entry.reject(new Error(resp.message));
       } else {
         entry.resolve(resp);
       }
     };
-    this.worker.onerror = (ev) => {
+
+    worker.onerror = (ev) => {
       const err = new Error(ev.message || "WASM worker crashed");
-      for (const [, p] of this.pending) {
+      for (const [, p] of pending) {
         p.reject(err);
       }
-      this.pending.clear();
+      pending.clear();
     };
+
+    return slot;
   }
 
-  private call(req: WasmRequest): Promise<WasmResponse> {
+  private ensureRulesSlot(): WorkerSlot {
+    if (!this.rulesSlot) {
+      this.rulesSlot = this.createSlot();
+    }
+    return this.rulesSlot;
+  }
+
+  private ensureAnalysisSlots(count: number): WorkerSlot[] {
+    while (this.analysisSlots.length < count) {
+      this.analysisSlots.push(this.createSlot());
+    }
+    return this.analysisSlots.slice(0, count);
+  }
+
+  private callOnSlot(
+    slot: WorkerSlot,
+    req: WasmRequest,
+    onProgress?: (progress: AnalysisProgress) => void,
+  ): Promise<WasmResponse> {
     const id = this.nextId++;
     return new Promise((resolve, reject) => {
-      this.pending.set(id, { resolve, reject });
-      this.worker.postMessage({ id, req });
+      slot.pending.set(id, { resolve, reject, onProgress });
+      slot.worker.postMessage({ id, req });
     });
   }
 
+  /**
+   * Immediately preempt any in-flight analysis workers without touching the
+   * interactive rules worker or idle analysis workers.
+   */
+  cancelAnalysis(): void {
+    this.activeAnalysisRunId += 1;
+    const survivors: WorkerSlot[] = [];
+    for (const slot of this.analysisSlots) {
+      if (slot.pending.size > 0) {
+        slot.worker.terminate();
+        const err = new AnalysisCancelledError();
+        for (const [, p] of slot.pending) {
+          p.reject(err);
+        }
+        slot.pending.clear();
+      } else {
+        survivors.push(slot);
+      }
+    }
+    this.analysisSlots = survivors;
+  }
+
   async inspect(fen?: string, historyHashes?: string[]): Promise<PositionSnapshot> {
-    const resp = await this.call({ cmd: "inspect", fen, history_hashes: historyHashes });
+    const resp = await this.callOnSlot(this.ensureRulesSlot(), {
+      cmd: "inspect",
+      fen,
+      history_hashes: historyHashes,
+    });
     if (resp.ok !== "snapshot") throw new Error(`Unexpected response: ${resp.ok}`);
     return resp;
   }
@@ -61,7 +193,7 @@ export class MakhosEngineClient {
     move: string,
     historyHashes?: string[],
   ): Promise<{ notation: string; applied: MoveDto; snapshot: PositionSnapshot }> {
-    const resp = await this.call({
+    const resp = await this.callOnSlot(this.ensureRulesSlot(), {
       cmd: "apply_move",
       fen,
       move,
@@ -71,20 +203,187 @@ export class MakhosEngineClient {
     return { notation: resp.notation, applied: resp.applied, snapshot: resp.snapshot };
   }
 
-  async analyze(
-    fen: string,
-    opts: { maxDepth?: number; maxNodes?: number; multipv?: number; historyHashes?: string[] } = {},
-  ): Promise<AnalysisResult> {
-    const resp = await this.call({
-      cmd: "analyze",
-      fen,
-      max_depth: opts.maxDepth ?? 8,
-      max_nodes: opts.maxNodes ?? 350_000,
-      multipv: opts.multipv ?? 3,
-      history_hashes: opts.historyHashes,
+  async analyze(fen: string, opts: AnalyzeOptions = {}): Promise<AnalysisResult> {
+    this.cancelAnalysis();
+    const runId = this.activeAnalysisRunId;
+
+    const maxDepth = Math.max(1, Math.min(30, Math.round(opts.maxDepth ?? 8)));
+    const maxTimeMs =
+      opts.maxTimeMs !== undefined && opts.maxTimeMs > 0 ? Math.round(opts.maxTimeMs) : undefined;
+    const maxNodes = opts.maxNodes;
+    const multipv = Math.max(1, opts.multipv ?? 3);
+    const threads = Math.max(1, Math.min(16, Math.round(opts.threads ?? 1)));
+
+    let moveNotations = opts.legalMoves;
+    if (threads > 1 && !moveNotations) {
+      const snap = await this.inspect(fen, opts.historyHashes);
+      if (runId !== this.activeAnalysisRunId) {
+        throw new AnalysisCancelledError();
+      }
+      moveNotations = snap.legal_moves.map((m) => m.long_notation);
+    }
+
+    if (threads <= 1 || !moveNotations || moveNotations.length <= 1) {
+      const [slot] = this.ensureAnalysisSlots(1);
+      let latestLines: AnalysisLine[] = [];
+      let lastEmit = 0;
+
+      const resp = await this.callOnSlot(
+        slot,
+        {
+          cmd: "analyze",
+          fen,
+          max_depth: maxDepth,
+          max_nodes: maxNodes,
+          max_time_ms: maxTimeMs,
+          multipv,
+          history_hashes: opts.historyHashes,
+        },
+        (p) => {
+          if (runId !== this.activeAnalysisRunId) return;
+          const hasLines = p.lines !== undefined;
+          if (hasLines) {
+            latestLines = p.lines!;
+          }
+          const now = performance.now();
+          if (!hasLines && now - lastEmit < 50) return;
+          lastEmit = now;
+          opts.onProgress?.({
+            depth: p.depth,
+            nodes: p.nodes,
+            lines: latestLines,
+          });
+        },
+      );
+      if (runId !== this.activeAnalysisRunId) {
+        throw new AnalysisCancelledError();
+      }
+      if (resp.ok !== "analysis") throw new Error(`Unexpected response: ${resp.ok}`);
+      return resp;
+    }
+
+    const workerCount = Math.min(threads, moveNotations.length);
+    const buckets: string[][] = Array.from({ length: workerCount }, () => []);
+    moveNotations.forEach((mv, idx) => {
+      buckets[idx % workerCount].push(mv);
     });
-    if (resp.ok !== "analysis") throw new Error(`Unexpected response: ${resp.ok}`);
-    return resp;
+
+    const perWorkerNodes =
+      maxNodes !== undefined && maxNodes > 0
+        ? Math.max(1, Math.ceil(maxNodes / workerCount))
+        : maxNodes;
+
+    const slots = this.ensureAnalysisSlots(workerCount);
+    const states = Array.from({ length: workerCount }, () => ({
+      depth: 0,
+      nodes: 0,
+      lines: [] as AnalysisLine[],
+      foundMate: false,
+    }));
+
+    let lastEmit = 0;
+    const emitMerged = (force: boolean) => {
+      if (runId !== this.activeAnalysisRunId || !opts.onProgress) return;
+      const now = performance.now();
+      if (!force && now - lastEmit < 55) return;
+      lastEmit = now;
+
+      let totalNodes = 0;
+      const nonMateDepths: number[] = [];
+      let maxDepthSeen = 0;
+      const allLines: AnalysisLine[] = [];
+
+      for (const st of states) {
+        totalNodes += st.nodes;
+        if (st.depth > maxDepthSeen) maxDepthSeen = st.depth;
+        if (!st.foundMate) {
+          nonMateDepths.push(st.depth);
+        }
+        allLines.push(...st.lines);
+      }
+
+      const depth =
+        nonMateDepths.length > 0 ? Math.min(...nonMateDepths) : maxDepthSeen;
+
+      allLines.sort((a, b) => b.score_cp - a.score_cp);
+      const mergedLines = allLines.slice(0, multipv).map((line, i) => ({
+        ...line,
+        multipv: i + 1,
+      }));
+
+      opts.onProgress({
+        depth,
+        nodes: totalNodes,
+        lines: mergedLines,
+      });
+    };
+
+    const results = await Promise.all(
+      buckets.map(async (rootMoves, idx) => {
+        const resp = await this.callOnSlot(
+          slots[idx],
+          {
+            cmd: "analyze",
+            fen,
+            max_depth: maxDepth,
+            max_nodes: perWorkerNodes,
+            max_time_ms: maxTimeMs,
+            multipv: Math.min(multipv, rootMoves.length),
+            history_hashes: opts.historyHashes,
+            root_moves: rootMoves,
+          },
+          (p) => {
+            if (runId !== this.activeAnalysisRunId) return;
+            states[idx].depth = p.depth;
+            states[idx].nodes = p.nodes;
+            if (p.lines !== undefined) {
+              states[idx].lines = p.lines;
+              states[idx].foundMate =
+                p.lines.length > 0 && p.lines[0].mate_in !== null;
+            }
+            emitMerged(false);
+          },
+        );
+        if (resp.ok !== "analysis") throw new Error(`Unexpected response: ${resp.ok}`);
+        states[idx].depth = resp.depth;
+        states[idx].nodes = resp.nodes;
+        states[idx].lines = resp.lines;
+        states[idx].foundMate =
+          resp.lines.length > 0 && resp.lines[0].mate_in !== null;
+        emitMerged(true);
+        return resp;
+      }),
+    );
+
+    if (runId !== this.activeAnalysisRunId) {
+      throw new AnalysisCancelledError();
+    }
+
+    let totalNodes = 0;
+    const nonMateDepths: number[] = [];
+    let maxDepthSeen = 0;
+    const allLines: AnalysisLine[] = [];
+    for (const r of results) {
+      totalNodes += r.nodes;
+      if (r.depth > maxDepthSeen) maxDepthSeen = r.depth;
+      const isMate = r.lines.length > 0 && r.lines[0].mate_in !== null;
+      if (r.depth > 0 && !isMate) {
+        nonMateDepths.push(r.depth);
+      }
+      allLines.push(...r.lines);
+    }
+
+    allLines.sort((a, b) => b.score_cp - a.score_cp);
+    const mergedLines = allLines.slice(0, multipv).map((line, i) => ({
+      ...line,
+      multipv: i + 1,
+    }));
+
+    return {
+      depth: nonMateDepths.length > 0 ? Math.min(...nonMateDepths) : maxDepthSeen,
+      nodes: totalNodes,
+      lines: mergedLines,
+    };
   }
 
   async aiMove(
@@ -93,7 +392,7 @@ export class MakhosEngineClient {
     historyHashes?: string[],
   ): Promise<{ chosen: MoveDto | null; analysis: AnalysisResult }> {
     const seed = Math.floor(Math.random() * 1_000_000_000);
-    const resp = await this.call({
+    const resp = await this.callOnSlot(this.ensureRulesSlot(), {
       cmd: "ai_move",
       fen,
       level,
@@ -111,7 +410,7 @@ export class MakhosEngineClient {
     lightPlayer?: string;
     darkPlayer?: string;
   }): Promise<string> {
-    const resp = await this.call({
+    const resp = await this.callOnSlot(this.ensureRulesSlot(), {
       cmd: "export_pdn",
       initial_fen: params.initialFen,
       moves: params.moves,
@@ -130,7 +429,7 @@ export class MakhosEngineClient {
     hashes: string[];
     outcome: GameOutcome;
   }> {
-    const resp = await this.call({ cmd: "import_pdn", pdn });
+    const resp = await this.callOnSlot(this.ensureRulesSlot(), { cmd: "import_pdn", pdn });
     if (resp.ok !== "imported_pdn") throw new Error(`Unexpected response: ${resp.ok}`);
     return {
       initialFen: resp.initial_fen,
@@ -142,10 +441,25 @@ export class MakhosEngineClient {
   }
 
   async clearCache(): Promise<void> {
-    await this.call({ cmd: "clear_cache" });
+    this.cancelAnalysis();
+    const targets: WorkerSlot[] = [...this.analysisSlots];
+    if (this.rulesSlot) targets.push(this.rulesSlot);
+    await Promise.all(
+      targets.map((slot) => this.callOnSlot(slot, { cmd: "clear_cache" }).catch(() => {})),
+    );
   }
 
   destroy(): void {
-    this.worker.terminate();
+    this.cancelAnalysis();
+    if (this.rulesSlot) {
+      this.rulesSlot.worker.terminate();
+      this.rulesSlot.pending.clear();
+      this.rulesSlot = null;
+    }
+    for (const slot of this.analysisSlots) {
+      slot.worker.terminate();
+      slot.pending.clear();
+    }
+    this.analysisSlots = [];
   }
 }

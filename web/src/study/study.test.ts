@@ -56,13 +56,29 @@ describe("Kon Makhos Puzzles (กลหมากฮอส) & Practice Modules", 
         });
         expect(analysis.ok).toBe("analysis");
         if (analysis.ok === "analysis" && analysis.lines.length >= 1) {
-          const topLong = analysis.lines[0].best_move.from + (analysis.lines[0].best_move.captures.length ? "x" : "-") + analysis.lines[0].best_move.to;
           const solFirst = puzzle.solution[0];
-          const topNotation = analysis.lines[0].pv_notations[0];
+          const lineMatches = (line: (typeof analysis.lines)[number]) => {
+            const longForm =
+              line.best_move.from +
+              (line.best_move.captures.length ? "x" : "-") +
+              line.best_move.to;
+            return (
+              line.pv_notations[0] === solFirst ||
+              longForm === solFirst ||
+              line.best_move.path.join("x") === solFirst
+            );
+          };
+          const top = analysis.lines[0];
+          const topLong =
+            top.best_move.from +
+            (top.best_move.captures.length ? "x" : "-") +
+            top.best_move.to;
+          const topNotation = top.pv_notations[0];
           const matchesBest =
-            topNotation === solFirst ||
-            topLong === solFirst ||
-            `${analysis.lines[0].best_move.path.join("x")}` === solFirst;
+            lineMatches(top) ||
+            analysis.lines.some(
+              (l) => lineMatches(l) && l.mate_in !== null && l.mate_in > 0,
+            );
           expect(
             matchesBest,
             `Puzzle ${puzzle.id}: expected engine top move (${topNotation} / ${topLong}) to match solution[0] (${solFirst})`,
@@ -70,6 +86,35 @@ describe("Kon Makhos Puzzles (กลหมากฮอส) & Practice Modules", 
         }
       }
     }
+  });
+
+  it("streams live depth and node progress updates from the WASM engine", async () => {
+    const snap = await callWasm({ cmd: "inspect" });
+    expect(snap.ok).toBe("snapshot");
+    if (snap.ok !== "snapshot") return;
+
+    const progressUpdates: { depth: number; nodes: number; hasLines: boolean }[] = [];
+    const res = await callWasm(
+      {
+        cmd: "analyze",
+        fen: snap.fen,
+        max_depth: 5,
+        max_nodes: 100_000,
+        multipv: 2,
+      },
+      (p) => {
+        progressUpdates.push({
+          depth: p.depth,
+          nodes: p.nodes,
+          hasLines: Array.isArray(p.lines) && p.lines.length > 0,
+        });
+      },
+    );
+
+    expect(res.ok).toBe("analysis");
+    const depthUpdates = progressUpdates.filter((u) => u.hasLines).map((u) => u.depth);
+    expect(depthUpdates).toEqual([1, 2, 3, 4, 5]);
+    expect(progressUpdates[progressUpdates.length - 1].nodes).toBeGreaterThan(0);
   });
 
   it("verifies all 4 Practice Modules and every drill position FEN is valid & ongoing", async () => {

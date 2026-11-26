@@ -1,6 +1,8 @@
 use crate::format::{TablebaseSlice, TbEntry, Wdl};
 use crate::index::{man_advance_sum, SliceIndexer, SliceKey};
-use makhos_core::{Color, Position, ALL_DIRS, Square};
+use makhos_core::{
+    apply_fast_move, generate_fast_legal_moves, Color, FastMoveList, Position, Square, ALL_DIRS,
+};
 use std::collections::BTreeMap;
 
 /// Generate all tablebase slices up to `max_pieces` (2..=5) in DAG order.
@@ -43,9 +45,11 @@ pub fn generate_slice(
         let mut win_queues: [Vec<usize>; 33] = std::array::from_fn(|_| Vec::new());
 
         // Step A: Initialize positions in this man_advance_sum bucket
+        let mut moves = FastMoveList::new();
+        let mut child_moves = FastMoveList::new();
         for &idx in &buckets[rank_sum] {
             let pos = indexer.decode(idx).unwrap();
-            let moves = pos.legal_moves();
+            let is_capture = generate_fast_legal_moves(&pos, &mut moves);
 
             if moves.is_empty() {
                 entries[idx] = TbEntry::loss(0).0;
@@ -53,12 +57,13 @@ pub fn generate_slice(
                 continue;
             }
 
-            if moves[0].is_capture() {
+            if is_capture {
                 let mut win_found = false;
                 let mut draw_found = false;
-                for mv in &moves {
-                    let child = pos.apply_move(mv);
-                    let child_entry = probe_solved_zeroing_child(&child, prev_slices);
+                for &mv in moves.as_slice() {
+                    let child = apply_fast_move(&pos, mv);
+                    let child_entry =
+                        probe_solved_zeroing_child(&child, prev_slices, &mut child_moves);
                     match child_entry.wdl() {
                         Some(Wdl::Loss) => {
                             win_found = true;
@@ -88,17 +93,20 @@ pub fn generate_slice(
             let mut draw_found = false;
             let mut king_moves_cnt = 0u8;
 
-            for mv in &moves {
-                let is_man_move = (our_men & mv.from.bit()) != 0;
+            for &mv in moves.as_slice() {
+                let is_man_move = (our_men & (1u32 << (mv.from - 1))) != 0;
                 if is_man_move {
-                    let child = pos.apply_move(mv);
+                    let child = apply_fast_move(&pos, mv);
                     let child_entry = if mv.promotes {
-                        probe_solved_zeroing_child(&child, prev_slices)
-                    } else if child.legal_moves().is_empty() {
-                        TbEntry::loss(0)
+                        probe_solved_zeroing_child(&child, prev_slices, &mut child_moves)
                     } else {
-                        let c_idx = indexer.encode(&child);
-                        TbEntry(entries[c_idx])
+                        generate_fast_legal_moves(&child, &mut child_moves);
+                        if child_moves.is_empty() {
+                            TbEntry::loss(0)
+                        } else {
+                            let c_idx = indexer.encode(&child);
+                            TbEntry(entries[c_idx])
+                        }
                     };
                     match child_entry.wdl() {
                         Some(Wdl::Loss) => {
@@ -185,8 +193,13 @@ pub fn generate_slice(
 fn probe_solved_zeroing_child(
     child: &Position,
     prev_slices: &BTreeMap<SliceKey, TablebaseSlice>,
+    scratch: &mut FastMoveList,
 ) -> TbEntry {
-    if child.pieces_of(child.side_to_move) == 0 || child.legal_moves().is_empty() {
+    if child.pieces_of(child.side_to_move) == 0 {
+        return TbEntry::loss(0);
+    }
+    generate_fast_legal_moves(child, scratch);
+    if scratch.is_empty() {
         return TbEntry::loss(0);
     }
     let child_key = SliceKey::from_position(child);

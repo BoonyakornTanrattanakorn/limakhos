@@ -80,6 +80,35 @@ impl SliceKey {
         }
         keys
     }
+
+    /// Return all valid dependency slices reachable from `self` via captures and/or Man promotions,
+    /// ordered in topological DAG order (increasing total_pieces, then increasing total_men).
+    pub fn dependencies(self) -> Vec<SliceKey> {
+        let light_total = self.lm + self.lk;
+        let dark_total = self.dm + self.dk;
+        let mut deps = Vec::new();
+        for lm2 in 0..=self.lm {
+            let max_lk2 = light_total - lm2;
+            for dm2 in 0..=self.dm {
+                let max_dk2 = dark_total - dm2;
+                for lk2 in 0..=max_lk2 {
+                    for dk2 in 0..=max_dk2 {
+                        let dep = SliceKey {
+                            lm: lm2,
+                            lk: lk2,
+                            dm: dm2,
+                            dk: dk2,
+                        };
+                        if dep != self && dep.is_valid_endgame_slice() {
+                            deps.push(dep);
+                        }
+                    }
+                }
+            }
+        }
+        deps.sort_by_key(|k| (k.total_pieces(), k.total_men(), k.lm, k.lk, k.dm, k.dk));
+        deps
+    }
 }
 
 /// Combinatorial indexer for a single `SliceKey`.

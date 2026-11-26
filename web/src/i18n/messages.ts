@@ -103,6 +103,37 @@ export interface Messages {
   practiceHint: string;
   practiceWinMsg: string;
   practiceFailMsg: string;
+  settings: string;
+  appearance: string;
+  uiTheme: string;
+  themeDark: string;
+  themeLight: string;
+  boardTheme: string;
+  boardBrown: string;
+  boardBlue: string;
+  boardGreen: string;
+  boardWalnut: string;
+  tabOpening: string;
+  tabFenPdn: string;
+  tabLobby: string;
+  tabLeaderboard: string;
+  tabRecentGames: string;
+  rightClickHint: string;
+  evalBarLabel: string;
+  guestLabel: string;
+  engineLines: string;
+  boardOptions: string;
+  piecesCount: string;
+  lightShort: string;
+  darkShort: string;
+  shortcutsHint: string;
+  blackFirstToggle: string;
+  firstMover: string;
+  noMovesYetDark: string;
+  maxThreads: string;
+  maxDepthLabel: string;
+  maxTimeMsLabel: string;
+  nodesExplored: string;
 }
 
 export const MESSAGES: Record<Locale, Messages> = {
@@ -209,6 +240,37 @@ export const MESSAGES: Record<Locale, Messages> = {
     practiceHint: "Engine Hint",
     practiceWinMsg: "Drill mastered! You converted the winning position.",
     practiceFailMsg: "Drill missed (draw/loss) — restart and try again!",
+    settings: "Settings",
+    appearance: "Appearance",
+    uiTheme: "Theme",
+    themeDark: "Dark",
+    themeLight: "Light",
+    boardTheme: "Board Theme",
+    boardBrown: "Classic Brown",
+    boardBlue: "Lichess Blue",
+    boardGreen: "Tournament Green",
+    boardWalnut: "Thai Walnut",
+    tabOpening: "Opening",
+    tabFenPdn: "FEN & PDN",
+    tabLobby: "Lobby",
+    tabLeaderboard: "Leaderboard",
+    tabRecentGames: "Games",
+    rightClickHint: "Right-click & drag to draw arrows",
+    evalBarLabel: "Evaluation",
+    guestLabel: "Guest",
+    engineLines: "Lines",
+    boardOptions: "Board",
+    piecesCount: "Pieces",
+    lightShort: "Light",
+    darkShort: "Dark",
+    shortcutsHint: "←/→ step • Home/End jump • F flip",
+    blackFirstToggle: "Black moves first",
+    firstMover: "First Move",
+    noMovesYetDark: "No moves yet — Dark moves first.",
+    maxThreads: "Threads",
+    maxDepthLabel: "Max Depth",
+    maxTimeMsLabel: "Time",
+    nodesExplored: "nodes",
   },
   th: {
     appTitle: "Limakhos",
@@ -313,5 +375,36 @@ export const MESSAGES: Record<Locale, Messages> = {
     practiceHint: "ขอคำแนะนำ AI",
     practiceWinMsg: "ผ่านด่านสำเร็จ! ปิดเกมได้อย่างแม่นยำ",
     practiceFailMsg: "ยังไม่ผ่านด่าน (เสมอ/แพ้) — กดเริ่มใหม่เพื่อลองอีกครั้ง",
+    settings: "ตั้งค่า",
+    appearance: "รูปลักษณ์",
+    uiTheme: "ธีมหน้าจอ",
+    themeDark: "โหมดมืด",
+    themeLight: "โหมดสว่าง",
+    boardTheme: "ธีมกระดาน",
+    boardBrown: "น้ำตาลคลาสสิก",
+    boardBlue: "ฟ้าคลาสสิก",
+    boardGreen: "เขียวทัวร์นาเมนต์",
+    boardWalnut: "ไม้วอลนัตไทย",
+    tabOpening: "เปิดหมาก",
+    tabFenPdn: "FEN & PDN",
+    tabLobby: "ห้องเล่น",
+    tabLeaderboard: "อันดับ",
+    tabRecentGames: "กระดานล่าสุด",
+    rightClickHint: "คลิกขวาแล้วลากเพื่อวาดลูกศร",
+    evalBarLabel: "ค่าประเมิน",
+    guestLabel: "ผู้เยี่ยมชม",
+    engineLines: "แนวทาง",
+    boardOptions: "กระดาน",
+    piecesCount: "จำนวนหมาก",
+    lightShort: "อ่อน",
+    darkShort: "เข้ม",
+    shortcutsHint: "←/→ เดินทีละตา • Home/End ต้น-ท้าย • F กลับกระดาน",
+    blackFirstToggle: "สีเข้มเดินก่อน (Black first)",
+    firstMover: "ฝ่ายเดินก่อน",
+    noMovesYetDark: "ยังไม่มีตาเดิน — ฝ่ายสีเข้มเดินก่อน",
+    maxThreads: "เธรด",
+    maxDepthLabel: "ความลึก",
+    maxTimeMsLabel: "เวลา",
+    nodesExplored: "โหนด",
   },
 };

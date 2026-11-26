@@ -1,6 +1,8 @@
 use makhos_core::{from_fen, Color, Piece, PieceKind, Position, Square};
-use makhos_engine::{Engine, SearchConfig, TablebaseProbe, MATE_THRESHOLD};
-use makhos_tb::{SliceIndexer, SliceKey, TablebaseSet, Wdl};
+use makhos_engine::{
+    choose_ai_move_with_tb, Engine, SearchConfig, TablebaseProbe, MATE_THRESHOLD,
+};
+use makhos_tb::{LazyTablebase, SliceIndexer, SliceKey, TablebaseSet, Wdl};
 
 fn sq(n: u8) -> Square {
     Square::new(n).unwrap()
@@ -169,6 +171,7 @@ fn engine_analyze_with_tb_uses_exact_tablebase_scores() {
             max_nodes: Some(5_000),
             multipv: 1,
             history_hashes: Vec::new(),
+            ..Default::default()
         },
         Some(&tb as &dyn TablebaseProbe),
     );
@@ -189,8 +192,45 @@ fn engine_analyze_with_tb_uses_exact_tablebase_scores() {
             max_nodes: Some(5_000),
             multipv: 1,
             history_hashes: Vec::new(),
+            ..Default::default()
         },
         Some(&tb as &dyn TablebaseProbe),
     );
     assert_eq!(draw_res.lines[0].score_cp, 0);
+}
+
+#[test]
+fn lazy_tablebase_generates_minimal_slices_on_demand_and_drives_ai_endgames() {
+    let lazy_tb = LazyTablebase::embedded();
+    assert_eq!(lazy_tb.slice_count(), 0, "LazyTablebase must start with zero startup cost");
+
+    // Probe a 2K vs 1K endgame: should generate ONLY 1K vs 1K and 2K vs 1K (2 slices!)
+    let pos_2k1k = from_fen("W:WK1,K2:BK32").unwrap();
+    let res = lazy_tb.probe_entry(&pos_2k1k).expect("2K vs 1K must resolve lazily");
+    assert_eq!(res.wdl, Wdl::Win);
+    assert_eq!(lazy_tb.slice_count(), 2);
+
+    // AI Level 8 should play the exact tablebase move with 0 search nodes!
+    let mut engine = Engine::new();
+    let (mv, ai_res) = choose_ai_move_with_tb(
+        &mut engine,
+        &pos_2k1k,
+        &[pos_2k1k.hash],
+        8,
+        7,
+        Some(&lazy_tb as &dyn TablebaseProbe),
+    )
+    .expect("AI must pick exact TB move");
+    assert_eq!(ai_res.nodes, 0);
+    assert!(ai_res.lines[0].score_cp > MATE_THRESHOLD);
+    let after = pos_2k1k.apply_move(&mv);
+    assert_eq!(lazy_tb.probe_entry(&after).unwrap().wdl, Wdl::Loss);
+
+    // Probe a 4-piece King-only endgame (3K vs 1K): adds only the 3K vs 1K slice (3 total!)
+    let pos_3k1k = from_fen("W:WK1,K2,K3:BK32").unwrap();
+    let res_3k = lazy_tb
+        .probe_entry(&pos_3k1k)
+        .expect("3K vs 1K must resolve lazily");
+    assert_eq!(res_3k.wdl, Wdl::Win);
+    assert_eq!(lazy_tb.slice_count(), 3);
 }
