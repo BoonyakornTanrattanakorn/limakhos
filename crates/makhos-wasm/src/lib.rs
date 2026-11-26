@@ -22,6 +22,7 @@ thread_local! {
 }
 
 #[cfg(target_arch = "wasm32")]
+#[link(wasm_import_module = "env")]
 extern "C" {
     fn host_now_ms() -> f64;
     fn host_on_progress(ptr: *const u8, len: usize);
