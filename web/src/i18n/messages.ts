@@ -77,6 +77,13 @@ export interface Messages {
   onlineOfflineError: string;
   disconnected: string;
   ratingLabel: string;
+  openingExplorer: string;
+  openingBookNext: string;
+  outOfBook: string;
+  openingLinesCount: string;
+  openingStartHint: string;
+  openingFirstMover: string;
+  openingSecondMover: string;
 }
 
 export const MESSAGES: Record<Locale, Messages> = {
@@ -157,6 +164,13 @@ export const MESSAGES: Record<Locale, Messages> = {
     onlineOfflineError: "Online server unreachable. Local Analysis, AI, and 2P modes continue working 100% offline.",
     disconnected: "offline",
     ratingLabel: "Rating",
+    openingExplorer: "Opening Explorer (เปิดหมาก)",
+    openingBookNext: "Book Moves",
+    outOfBook: "Out of opening book — continue with local WASM analysis.",
+    openingLinesCount: "lines",
+    openingStartHint: "Pick a formation or play a book move to explore canonical Thai openings:",
+    openingFirstMover: "Light (1st)",
+    openingSecondMover: "Dark (2nd)",
   },
   th: {
     appTitle: "Limakhos",
@@ -235,5 +249,12 @@ export const MESSAGES: Record<Locale, Messages> = {
     onlineOfflineError: "ไม่สามารถเชื่อมต่อเซิร์ฟเวอร์ออนไลน์ได้ (โหมดวิเคราะห์, AI และเล่น 2 คนยังใช้งานแบบออฟไลน์ได้ตามปกติ)",
     disconnected: "หลุดการเชื่อมต่อ",
     ratingLabel: "เรตติ้ง",
+    openingExplorer: "คลังเปิดหมาก (Opening Explorer)",
+    openingBookNext: "ตาเดินในตำรา",
+    outOfBook: "ออกนอกตำราเปิดหมากแล้ว — วิเคราะห์ต่อด้วยเอนจิน WASM ได้ทันที",
+    openingLinesCount: "สาย",
+    openingStartHint: "เลือกทรงหมากมาตรฐานหรือคลิกตาเดินในตำราเพื่อศึกษาแนวการเปิดหมาก:",
+    openingFirstMover: "ฝ่ายเดินก่อน (1–8)",
+    openingSecondMover: "ฝ่ายเดินหลัง (25–32)",
   },
 };

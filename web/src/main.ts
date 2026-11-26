@@ -12,6 +12,7 @@ import {
   type RoomSummary,
   type UserRecord,
 } from "./online/client";
+import { FORMATIONS, OPENING_BOOK, matchOpeningHistory } from "./study/openings";
 import { evalToLightPercent, formatClockMs, formatEvalLight } from "./ui/eval";
 
 type PlayMode = "analysis" | "ai" | "local" | "online";
@@ -109,6 +110,7 @@ class LimakhosApp {
   private statusEl!: HTMLElement;
   private onlinePanelEl!: HTMLElement | null;
   private analysisPanelEl!: HTMLElement;
+  private openingPanelEl!: HTMLElement | null;
   private movesPanelEl!: HTMLElement;
   private ioTextarea!: HTMLTextAreaElement;
   private toastEl!: HTMLElement;
@@ -238,6 +240,7 @@ class LimakhosApp {
           }
 
           <div class="card" id="analysis-card"></div>
+          ${this.mode === "analysis" ? `<div class="card" id="opening-card"></div>` : ""}
           <div class="card" id="moves-card"></div>
 
           <div class="card">
@@ -268,6 +271,7 @@ class LimakhosApp {
     this.statusEl = this.root.querySelector("#status-box")!;
     this.onlinePanelEl = this.root.querySelector("#online-panel");
     this.analysisPanelEl = this.root.querySelector("#analysis-card")!;
+    this.openingPanelEl = this.root.querySelector("#opening-card");
     this.movesPanelEl = this.root.querySelector("#moves-card")!;
     this.ioTextarea = this.root.querySelector("#io-text")!;
     this.toastEl = this.root.querySelector("#toast-msg")!;
@@ -1000,6 +1004,7 @@ class LimakhosApp {
     }
     this.renderEvalBar();
     this.renderAnalysisPanel();
+    this.renderOpeningPanel();
     this.renderMovesPanel();
   }
 
@@ -1496,6 +1501,144 @@ class LimakhosApp {
         if (tok && this.canHumanMoveNow()) {
           void this.commitNotation(tok);
         }
+      });
+    });
+  }
+
+  private async loadOpeningLine(lineId: string): Promise<void> {
+    const line = OPENING_BOOK.find((l) => l.id === lineId);
+    if (!line) return;
+    await this.engine.clearCache();
+    this.stopClock();
+    this.forcedOutcome = null;
+    this.lastAnalysis = null;
+
+    const startSnap = await this.engine.inspect();
+    const timeline: HistoryEntry[] = [
+      { fen: startSnap.fen, hash: startSnap.hash, notation: null, lastMove: null },
+    ];
+    let curFen = startSnap.fen;
+    let curSnap = startSnap;
+    const hashes = [startSnap.hash];
+
+    for (const moveTok of line.moves) {
+      const res = await this.engine.applyMove(curFen, moveTok, hashes);
+      timeline.push({
+        fen: res.snapshot.fen,
+        hash: res.snapshot.hash,
+        notation: res.notation,
+        lastMove: { from: res.applied.from, to: res.applied.to, path: res.applied.path },
+      });
+      curFen = res.snapshot.fen;
+      curSnap = res.snapshot;
+      hashes.push(res.snapshot.hash);
+    }
+
+    this.timeline = timeline;
+    this.cursor = timeline.length - 1;
+    this.currentSnapshot = curSnap;
+    this.syncBoard();
+    this.refreshPanels();
+    void this.triggerAnalysisIfEnabled();
+  }
+
+  private renderOpeningPanel(): void {
+    if (!this.openingPanelEl || this.mode !== "analysis") return;
+    const t = this.t();
+    const isTh = this.locale === "th";
+
+    // Only match book when playing from standard starting position
+    const startFen = this.timeline[0]?.fen ?? "";
+    const startDefault =
+      startFen.startsWith("W:W1,2,3,4,5,6,7,8:B25,26,27,28,29,30,31,32");
+    const playedNotations = startDefault
+      ? this.timeline.slice(1, this.cursor + 1).map((e) => e.notation ?? "").filter(Boolean)
+      : [];
+
+    const match = matchOpeningHistory(playedNotations);
+    const formationTitle = match.matchedFormation
+      ? `${isTh ? match.matchedFormation.nameTh : match.matchedFormation.nameEn}`
+      : match.activeLine
+        ? `${isTh ? match.activeLine.nameTh : match.activeLine.nameEn}`
+        : null;
+
+    const noteText = match.activeLine
+      ? isTh
+        ? match.activeLine.noteTh
+        : match.activeLine.noteEn
+      : match.matchedFormation
+        ? isTh
+          ? match.matchedFormation.summaryTh
+          : match.matchedFormation.summaryEn
+        : playedNotations.length === 0
+          ? t.openingStartHint
+          : t.outOfBook;
+
+    const formationHtml = `
+      <div class="opening-formation-box">
+        ${formationTitle ? `<div class="opening-formation-title">${escapeHtml(formationTitle)}</div>` : ""}
+        <div class="opening-note">${escapeHtml(noteText)}</div>
+      </div>
+    `;
+
+    const movesHtml =
+      match.nextMoves.length > 0
+        ? `<div class="book-move-list">
+            ${match.nextMoves
+              .map((bm) => {
+                const topLine = bm.lines[0];
+                const label = topLine
+                  ? isTh
+                    ? `${topLine.nameTh} • ${topLine.variationTh}`
+                    : `${topLine.nameEn} • ${topLine.variationEn}`
+                  : "";
+                return `
+                  <button class="book-move-btn" data-book-move="${escapeHtml(bm.notation)}">
+                    <span class="book-move-not">${escapeHtml(bm.notation)}</span>
+                    <span class="book-move-sub">${escapeHtml(label)}</span>
+                    <span class="badge-muted">${bm.lineCount} ${t.openingLinesCount}</span>
+                  </button>
+                `;
+              })
+              .join("")}
+          </div>`
+        : "";
+
+    const chipsHtml = `
+      <div class="formation-chips">
+        ${FORMATIONS.map((f) => {
+          const firstLine = OPENING_BOOK.find((l) => l.formationId === f.id);
+          const isActive = match.matchedFormation?.id === f.id;
+          return `<button class="formation-chip ${isActive ? "is-active" : ""}" data-formation-line="${escapeHtml(
+            firstLine?.id ?? "",
+          )}">${escapeHtml(isTh ? f.nameTh : f.nameEn)}</button>`;
+        }).join("")}
+      </div>
+    `;
+
+    this.openingPanelEl.innerHTML = `
+      <div class="card-header">
+        <h2 class="card-title">${t.openingExplorer}</h2>
+        <span class="badge-muted">${match.matchingLines.length} ${t.openingLinesCount}</span>
+      </div>
+      ${formationHtml}
+      ${movesHtml}
+      ${chipsHtml}
+    `;
+
+    this.openingPanelEl.querySelectorAll<HTMLButtonElement>("[data-book-move]").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const tok = btn.dataset.bookMove;
+        if (tok && this.canHumanMoveNow()) {
+          void this.commitNotation(tok);
+        }
+      });
+    });
+
+    this.openingPanelEl.querySelectorAll<HTMLButtonElement>("[data-formation-line]").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const lineId = btn.dataset.formationLine;
+        if (lineId) void this.loadOpeningLine(lineId);
       });
     });
   }

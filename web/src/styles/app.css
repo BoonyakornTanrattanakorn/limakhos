@@ -763,3 +763,89 @@ textarea {
   color: var(--muted);
   font-size: 0.76rem;
 }
+
+.opening-formation-box {
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  margin-bottom: 8px;
+}
+
+.opening-formation-title {
+  font-weight: 700;
+  font-size: 0.9rem;
+  color: var(--accent);
+  margin-bottom: 3px;
+}
+
+.opening-note {
+  font-size: 0.8rem;
+  color: var(--muted);
+}
+
+.book-move-list {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  max-height: 170px;
+  overflow-y: auto;
+}
+
+.book-move-btn {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  width: 100%;
+  padding: 6px 9px;
+  border-radius: 6px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  cursor: pointer;
+  text-align: left;
+  font-size: 0.83rem;
+}
+
+.book-move-btn:hover {
+  border-color: var(--accent);
+  background: var(--surface-2);
+}
+
+.book-move-not {
+  font-family: ui-monospace, monospace;
+  font-weight: 700;
+  color: var(--emerald);
+  min-width: 48px;
+}
+
+.book-move-sub {
+  flex: 1;
+  color: var(--muted);
+  font-size: 0.78rem;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.formation-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  margin-top: 8px;
+}
+
+.formation-chip {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 3px 9px;
+  font-size: 0.76rem;
+  cursor: pointer;
+}
+
+.formation-chip:hover,
+.formation-chip.is-active {
+  border-color: var(--accent);
+  color: var(--accent);
+}

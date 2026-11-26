@@ -504,6 +504,7 @@ dependencies = [
  "futures-util",
  "http-body-util",
  "makhos-core",
+ "makhos-tb",
  "rand",
  "rusqlite",
  "serde",
@@ -515,6 +516,15 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+]
+
+[[package]]
+name = "makhos-tb"
+version = "0.1.0"
+dependencies = [
+ "makhos-core",
+ "makhos-engine",
+ "serde",
 ]
 
 [[package]]
