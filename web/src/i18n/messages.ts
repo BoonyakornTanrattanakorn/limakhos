@@ -18,6 +18,7 @@ export interface Messages {
   mainDiagToggle: string;
   undo: string;
   resign: string;
+  confirmResign: string;
   engineAnalysis: string;
   engineOn: string;
   engineOff: string;
@@ -134,6 +135,23 @@ export interface Messages {
   maxDepthLabel: string;
   maxTimeMsLabel: string;
   nodesExplored: string;
+  navPlay: string;
+  navLearn: string;
+  navTools: string;
+  modeBasics: string;
+  toolAnalysisBoard: string;
+  toolOpeningExplorer: string;
+  toolImportGame: string;
+  basicsTitle: string;
+  basicsCompleted: string;
+  basicsLessonLabel: string;
+  basicsStepLabel: string;
+  basicsHint: string;
+  basicsRetry: string;
+  basicsNext: string;
+  basicsWrong: string;
+  basicsCorrect: string;
+  basicsAllDone: string;
 }
 
 export const MESSAGES: Record<Locale, Messages> = {
@@ -155,6 +173,7 @@ export const MESSAGES: Record<Locale, Messages> = {
     mainDiagToggle: "4–29",
     undo: "Undo",
     resign: "Resign",
+    confirmResign: "Confirm?",
     engineAnalysis: "Local WASM Analysis",
     engineOn: "Engine ON",
     engineOff: "Engine OFF",
@@ -271,6 +290,23 @@ export const MESSAGES: Record<Locale, Messages> = {
     maxDepthLabel: "Max Depth",
     maxTimeMsLabel: "Time",
     nodesExplored: "nodes",
+    navPlay: "PLAY",
+    navLearn: "LEARN",
+    navTools: "TOOLS",
+    modeBasics: "Learn Makhos Basics",
+    toolAnalysisBoard: "Analysis Board",
+    toolOpeningExplorer: "Opening Explorer",
+    toolImportGame: "Import Game (FEN / PDN)",
+    basicsTitle: "Makhos Basics",
+    basicsCompleted: "Completed",
+    basicsLessonLabel: "Lesson",
+    basicsStepLabel: "Step",
+    basicsHint: "Hint",
+    basicsRetry: "Retry",
+    basicsNext: "Next",
+    basicsWrong: "Not quite — check the explanation and try again!",
+    basicsCorrect: "Well done! Rule mastered.",
+    basicsAllDone: "All 6 Basics lessons completed! Ready for Practice & Puzzles.",
   },
   th: {
     appTitle: "Limakhos",
@@ -290,6 +326,7 @@ export const MESSAGES: Record<Locale, Messages> = {
     mainDiagToggle: "แกน 4–29",
     undo: "ย้อนกลับ",
     resign: "ยอมแพ้",
+    confirmResign: "ยืนยัน?",
     engineAnalysis: "วิเคราะห์ด้วยเอนจิน WASM",
     engineOn: "เปิดเอนจิน",
     engineOff: "ปิดเอนจิน",
@@ -406,5 +443,22 @@ export const MESSAGES: Record<Locale, Messages> = {
     maxDepthLabel: "ความลึก",
     maxTimeMsLabel: "เวลา",
     nodesExplored: "โหนด",
+    navPlay: "เล่น",
+    navLearn: "เรียนรู้",
+    navTools: "เครื่องมือ",
+    modeBasics: "เรียนรู้พื้นฐานหมากฮอส",
+    toolAnalysisBoard: "กระดานวิเคราะห์",
+    toolOpeningExplorer: "คลังเปิดหมาก",
+    toolImportGame: "นำเข้าเกม (FEN / PDN)",
+    basicsTitle: "พื้นฐานหมากฮอส (TCA 2025)",
+    basicsCompleted: "ผ่านแล้ว",
+    basicsLessonLabel: "บทที่",
+    basicsStepLabel: "ขั้นตอน",
+    basicsHint: "คำใบ้",
+    basicsRetry: "ลองใหม่",
+    basicsNext: "ถัดไป",
+    basicsWrong: "ยังไม่ตรงกติกา — ลองอ่านคำอธิบายแล้วเดินใหม่อีกครั้ง!",
+    basicsCorrect: "ยอดเยี่ยม! เข้าใจกติกาข้อนี้แล้ว",
+    basicsAllDone: "ยินดีด้วย! เรียนครบทั้ง 6 บทพื้นฐานแล้ว พร้อมลุยฝึกซ้อมและกลหมากฮอส",
   },
 };

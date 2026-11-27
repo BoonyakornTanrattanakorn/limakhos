@@ -41,11 +41,22 @@
 }
 
 .board-stage.no-eval {
-  grid-template-columns: 1fr;
+  grid-template-columns: 22px 1fr;
 }
 
 .board-stage.no-eval .eval-bar {
-  display: none;
+  visibility: hidden;
+  pointer-events: none;
+}
+
+@media (max-width: 759px) {
+  .board-stage.no-eval {
+    grid-template-columns: 1fr;
+  }
+
+  .board-stage.no-eval .eval-bar {
+    display: none;
+  }
 }
 
 .eval-bar {

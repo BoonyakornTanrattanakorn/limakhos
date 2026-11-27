@@ -13,6 +13,7 @@ import {
   type RoomSummary,
   type UserRecord,
 } from "./online/client";
+import { BASICS_LESSONS, type BasicsLesson, type BasicsLessonStep } from "./study/basics";
 import { FORMATIONS, OPENING_BOOK, matchOpeningHistory } from "./study/openings";
 import { PRACTICE_MODULES, type PracticeDrill, type PracticeModule } from "./study/practice";
 import { KON_MAKHOS_PUZZLES, type KonMakhosPuzzle } from "./study/puzzles";
@@ -28,7 +29,9 @@ import {
   type UiTheme,
 } from "./ui/prefs";
 
-type PlayMode = "analysis" | "ai" | "local" | "online" | "puzzles" | "practice";
+type PlayMode = "analysis" | "ai" | "local" | "online" | "basics" | "puzzles" | "practice";
+type NavMenuGroup = "play" | "learn" | "tools";
+type ToolMenuItem = "analysis" | "opening" | "import";
 
 interface TimeControlOption {
   id: string;
@@ -84,24 +87,32 @@ function formatElapsedMs(ms: number): string {
   return `${(ms / 1000).toFixed(1)} s`;
 }
 
+function formatCompactCount(n: number): string {
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(2)}M`;
+  if (n >= 10_000) return `${(n / 1_000).toFixed(1)}k`;
+  return n.toLocaleString();
+}
+
 interface StudyProgress {
   puzzleRating: number;
   solvedPuzzles: string[];
   completedDrills: string[];
+  completedBasics: string[];
 }
 
 function loadStudyProgress(): StudyProgress {
   try {
     const raw = localStorage.getItem(LS_STUDY_PROGRESS_KEY);
-    if (!raw) return { puzzleRating: 1200, solvedPuzzles: [], completedDrills: [] };
+    if (!raw) return { puzzleRating: 1200, solvedPuzzles: [], completedDrills: [], completedBasics: [] };
     const parsed = JSON.parse(raw) as Partial<StudyProgress>;
     return {
       puzzleRating: typeof parsed.puzzleRating === "number" ? parsed.puzzleRating : 1200,
       solvedPuzzles: Array.isArray(parsed.solvedPuzzles) ? parsed.solvedPuzzles : [],
       completedDrills: Array.isArray(parsed.completedDrills) ? parsed.completedDrills : [],
+      completedBasics: Array.isArray(parsed.completedBasics) ? parsed.completedBasics : [],
     };
   } catch {
-    return { puzzleRating: 1200, solvedPuzzles: [], completedDrills: [] };
+    return { puzzleRating: 1200, solvedPuzzles: [], completedDrills: [], completedBasics: [] };
   }
 }
 
@@ -137,6 +148,9 @@ class LimakhosApp {
 
   // UI-only view states
   private settingsOpen = false;
+  private openNavMenu: NavMenuGroup | null = null;
+  private navOpenedByHover = false;
+  private activeToolItem: ToolMenuItem = "analysis";
   private underboardTab: "opening" | "fen" = "opening";
   private onlineSubTab: "lobby" | "leaderboard" | "recent" = "lobby";
 
@@ -159,6 +173,8 @@ class LimakhosApp {
   private clocksMs: Record<Color, number> = { light: 0, dark: 0 };
   private clockTimer: number | null = null;
   private lastTick = 0;
+  private resignConfirming = false;
+  private resignConfirmTimer: number | null = null;
   private toastMessage = "";
 
   // Online multiplayer state
@@ -178,8 +194,15 @@ class LimakhosApp {
   private onlineClockAnchorPerf = 0;
   private onlineSyncSeq = 0;
 
-  // Puzzles & Practice state
+  // Puzzles, Basics & Practice state
   private studyProgress: StudyProgress = loadStudyProgress();
+  private activeBasicsLessonIdx = 0;
+  private activeBasicsStepIdx = 0;
+  private basicsStatus: "trying" | "wrong" | "completed" = "trying";
+  private basicsShowHint = false;
+  private basicsHintArrow: BoardArrow | null = null;
+  private basicsRunSeq = 0;
+
   private activePuzzleIdx = 0;
   private puzzleStep = 0;
   private puzzleStatus: "solving" | "wrong" | "solved" | "revealed" = "solving";
@@ -231,8 +254,20 @@ class LimakhosApp {
     this.renderShell();
 
     document.addEventListener("click", (ev) => {
-      if (!this.settingsOpen) return;
       const target = ev.target;
+      if (this.resignConfirming) {
+        if (!(target instanceof Element && target.closest("#btn-resign"))) {
+          this.clearResignConfirm();
+        }
+      }
+      if (this.openNavMenu !== null) {
+        if (!(target instanceof Element && target.closest(".site-nav"))) {
+          this.openNavMenu = null;
+          this.navOpenedByHover = false;
+          this.syncNavMenus();
+        }
+      }
+      if (!this.settingsOpen) return;
       if (target instanceof Node && this.settingsWrapEl?.contains(target)) return;
       if (target instanceof Element && target.closest(".settings-wrap")) return;
       this.settingsOpen = false;
@@ -275,6 +310,8 @@ class LimakhosApp {
         return t.modeAi;
       case "local":
         return t.modeLocal;
+      case "basics":
+        return t.modeBasics;
       case "puzzles":
         return t.modePuzzles;
       case "practice":
@@ -290,20 +327,71 @@ class LimakhosApp {
 
   private shouldShowEvalBar(): boolean {
     if (!this.analysisEnabled) return false;
-    if (this.mode === "puzzles") return false;
+    if (this.mode === "puzzles" || this.mode === "basics") return false;
     if (this.mode === "online" && this.onlineState?.status === "active") return false;
     if (this.mode === "practice" && !this.practiceLiveEval) return false;
     return true;
   }
 
+  private syncNavMenus(): void {
+    this.root.querySelectorAll<HTMLElement>("[data-nav-group]").forEach((groupEl) => {
+      const groupId = groupEl.dataset.navGroup as NavMenuGroup;
+      const isOpen = this.openNavMenu === groupId;
+      groupEl.classList.toggle("is-open", isOpen);
+      const trigger = groupEl.querySelector<HTMLButtonElement>("[data-nav-trigger]");
+      if (trigger) {
+        trigger.setAttribute("aria-expanded", String(isOpen));
+      }
+    });
+    this.root.querySelectorAll<HTMLButtonElement>("[data-nav-tool]").forEach((btn) => {
+      const tool = btn.dataset.navTool as ToolMenuItem;
+      btn.classList.toggle("is-active", this.mode === "analysis" && this.activeToolItem === tool);
+    });
+  }
+
+  private async selectToolItem(tool: ToolMenuItem): Promise<void> {
+    this.openNavMenu = null;
+    this.navOpenedByHover = false;
+    this.activeToolItem = tool;
+    const targetTab: "opening" | "fen" = tool === "import" ? "fen" : "opening";
+
+    if (this.mode !== "analysis") {
+      this.leaveOnlineRoom(false);
+      this.clearResignConfirm(false);
+      this.cancelAnalysis();
+      this.mode = "analysis";
+      this.settingsOpen = false;
+      this.analysisEnabled = true;
+      this.orientation = this.prefs.blackFirst ? "dark" : "light";
+      this.underboardTab = targetTab;
+      this.renderShell();
+      await this.startNewGame();
+    } else {
+      this.syncNavMenus();
+      this.underboardTab = targetTab;
+      this.syncUnderboardTabs();
+    }
+
+    if (tool === "opening") {
+      this.openingPanelEl?.scrollIntoView({ behavior: "smooth", block: "nearest" });
+    } else if (tool === "import") {
+      this.ioTextarea?.scrollIntoView({ behavior: "smooth", block: "nearest" });
+      this.ioTextarea?.focus();
+    }
+  }
+
   private switchMode(nextMode: PlayMode): void {
+    this.openNavMenu = null;
+    this.navOpenedByHover = false;
     if (nextMode === this.mode) {
+      this.syncNavMenus();
       if (nextMode === "online") {
         void this.refreshOnlineLobby();
       }
       return;
     }
     this.leaveOnlineRoom(false);
+    this.clearResignConfirm(false);
     this.cancelAnalysis();
     this.mode = nextMode;
     this.settingsOpen = false;
@@ -315,12 +403,15 @@ class LimakhosApp {
       this.orientation = this.prefs.blackFirst ? "dark" : "light";
     }
     if (nextMode === "analysis") {
+      this.activeToolItem = "analysis";
       this.underboardTab = "opening";
     }
     this.renderShell();
     if (nextMode === "online") {
       void this.startNewGame();
       void this.refreshOnlineLobby();
+    } else if (nextMode === "basics") {
+      void this.loadBasicsStep(this.activeBasicsLessonIdx, this.activeBasicsStepIdx);
     } else if (nextMode === "puzzles") {
       void this.loadPuzzle(this.activePuzzleIdx);
     } else if (nextMode === "practice") {
@@ -340,23 +431,95 @@ class LimakhosApp {
       walnut: t.boardWalnut,
     };
 
-    const navModes: PlayMode[] = ["analysis", "ai", "local", "puzzles", "practice", "online"];
-    const navHtml = navModes
-      .map(
-        (m) => `
-          <button
-            type="button"
-            role="tab"
-            aria-selected="${this.mode === m}"
-            class="site-nav-btn ${this.mode === m ? "is-active" : ""}"
-            data-mode="${m}"
-          >
-            ${this.modeIcon(m)}
-            <span>${this.modeTitle(m)}</span>
+    const isPlayGroup = this.mode === "ai" || this.mode === "online" || this.mode === "local";
+    const isLearnGroup = this.mode === "basics" || this.mode === "practice" || this.mode === "puzzles";
+    const isToolsGroup = this.mode === "analysis";
+
+    const navHtml = `
+      <div class="nav-group ${this.openNavMenu === "play" ? "is-open" : ""}" data-nav-group="play">
+        <button
+          type="button"
+          class="site-nav-btn ${isPlayGroup ? "is-active" : ""}"
+          data-nav-trigger="play"
+          aria-expanded="${this.openNavMenu === "play"}"
+          aria-haspopup="true"
+        >
+          ${ICONS.play}
+          <span>${escapeHtml(t.navPlay)}</span>
+          ${ICONS.chevronDown}
+        </button>
+        <div class="nav-dropdown" role="menu">
+          <button type="button" role="menuitem" class="nav-dropdown-item ${this.mode === "ai" ? "is-active" : ""}" data-nav-mode="ai">
+            ${ICONS.ai}
+            <span>${escapeHtml(t.modeAi)}</span>
           </button>
-        `,
-      )
-      .join("");
+          <button type="button" role="menuitem" class="nav-dropdown-item ${this.mode === "online" ? "is-active" : ""}" data-nav-mode="online">
+            ${ICONS.online}
+            <span>${escapeHtml(t.modeOnline)}</span>
+          </button>
+          <button type="button" role="menuitem" class="nav-dropdown-item ${this.mode === "local" ? "is-active" : ""}" data-nav-mode="local">
+            ${ICONS.local}
+            <span>${escapeHtml(t.modeLocal)}</span>
+          </button>
+        </div>
+      </div>
+
+      <div class="nav-group ${this.openNavMenu === "learn" ? "is-open" : ""}" data-nav-group="learn">
+        <button
+          type="button"
+          class="site-nav-btn ${isLearnGroup ? "is-active" : ""}"
+          data-nav-trigger="learn"
+          aria-expanded="${this.openNavMenu === "learn"}"
+          aria-haspopup="true"
+        >
+          ${ICONS.basics}
+          <span>${escapeHtml(t.navLearn)}</span>
+          ${ICONS.chevronDown}
+        </button>
+        <div class="nav-dropdown" role="menu">
+          <button type="button" role="menuitem" class="nav-dropdown-item ${this.mode === "basics" ? "is-active" : ""}" data-nav-mode="basics">
+            ${ICONS.basics}
+            <span>${escapeHtml(t.modeBasics)}</span>
+          </button>
+          <button type="button" role="menuitem" class="nav-dropdown-item ${this.mode === "practice" ? "is-active" : ""}" data-nav-mode="practice">
+            ${ICONS.practice}
+            <span>${escapeHtml(t.modePractice)}</span>
+          </button>
+          <button type="button" role="menuitem" class="nav-dropdown-item ${this.mode === "puzzles" ? "is-active" : ""}" data-nav-mode="puzzles">
+            ${ICONS.puzzles}
+            <span>${escapeHtml(t.modePuzzles)}</span>
+          </button>
+        </div>
+      </div>
+
+      <div class="nav-group ${this.openNavMenu === "tools" ? "is-open" : ""}" data-nav-group="tools">
+        <button
+          type="button"
+          class="site-nav-btn ${isToolsGroup ? "is-active" : ""}"
+          data-nav-trigger="tools"
+          aria-expanded="${this.openNavMenu === "tools"}"
+          aria-haspopup="true"
+        >
+          ${ICONS.tools}
+          <span>${escapeHtml(t.navTools)}</span>
+          ${ICONS.chevronDown}
+        </button>
+        <div class="nav-dropdown" role="menu">
+          <button type="button" role="menuitem" class="nav-dropdown-item ${isToolsGroup && this.activeToolItem === "analysis" ? "is-active" : ""}" data-nav-tool="analysis">
+            ${ICONS.analysis}
+            <span>${escapeHtml(t.toolAnalysisBoard)}</span>
+          </button>
+          <button type="button" role="menuitem" class="nav-dropdown-item ${isToolsGroup && this.activeToolItem === "opening" ? "is-active" : ""}" data-nav-tool="opening">
+            ${ICONS.book}
+            <span>${escapeHtml(t.toolOpeningExplorer)}</span>
+          </button>
+          <button type="button" role="menuitem" class="nav-dropdown-item ${isToolsGroup && this.activeToolItem === "import" ? "is-active" : ""}" data-nav-tool="import">
+            ${ICONS.import}
+            <span>${escapeHtml(t.toolImportGame)}</span>
+          </button>
+        </div>
+      </div>
+    `;
 
     const leftModeHtml = this.renderLeftModeHtml();
     const showEval = this.shouldShowEvalBar();
@@ -372,7 +535,7 @@ class LimakhosApp {
             <span class="site-brand-sub">8</span>
           </div>
 
-          <nav class="site-nav" role="tablist" aria-label="Modes">
+          <nav class="site-nav" aria-label="Modes">
             ${navHtml}
           </nav>
 
@@ -586,13 +749,15 @@ class LimakhosApp {
             <div class="action-bar">
               ${
                 this.mode === "online" && this.onlineRoomId
-                  ? `<button type="button" class="li-btn is-danger" id="btn-leave-room">${ICONS.leave} <span>${t.leaveRoom}</span></button>`
-                  : `<button type="button" class="li-btn is-primary" id="btn-new">${ICONS.newGame} <span>${t.newGame}</span></button>`
+                  ? `<button type="button" class="li-action-btn is-leave" id="btn-leave-room">${ICONS.leave}<span>${escapeHtml(t.leaveRoom)}</span></button>`
+                  : `<button type="button" class="li-action-btn is-new" id="btn-new">${ICONS.newGame}<span>${escapeHtml(t.newGame)}</span></button>`
               }
-              <button type="button" class="li-btn" id="btn-undo" ${
-                this.mode === "online" || this.mode === "puzzles" ? "disabled" : ""
-              }>${ICONS.undo} <span>${t.undo}</span></button>
-              <button type="button" class="li-btn is-danger" id="btn-resign">${ICONS.resign} <span>${t.resign}</span></button>
+              <button type="button" class="li-action-btn is-undo" id="btn-undo" ${
+                this.canUndoNow() ? "" : "disabled"
+              }>${ICONS.undo}<span>${escapeHtml(t.undo)}</span></button>
+              <button type="button" class="li-action-btn is-resign" id="btn-resign" ${
+                this.canResignNow() ? "" : "disabled"
+              }>${ICONS.resign}<span>${escapeHtml(t.resign)}</span></button>
             </div>
           </div>
 
@@ -716,7 +881,7 @@ class LimakhosApp {
       `;
     }
 
-    if (this.mode === "puzzles" || this.mode === "practice") {
+    if (this.mode === "basics" || this.mode === "puzzles" || this.mode === "practice") {
       return `<div id="study-panel" class="online-stack"></div>`;
     }
 
@@ -814,10 +979,61 @@ class LimakhosApp {
   }
 
   private bindControls(): void {
-    this.root.querySelectorAll<HTMLButtonElement>("[data-mode]").forEach((btn) => {
+    this.root.querySelectorAll<HTMLElement>("[data-nav-group]").forEach((groupEl) => {
+      const groupId = groupEl.dataset.navGroup as NavMenuGroup;
+      groupEl.addEventListener("pointerenter", (ev) => {
+        if (ev.pointerType !== "mouse") return;
+        if (this.settingsOpen) {
+          this.settingsOpen = false;
+          this.syncSettingsPopover();
+        }
+        this.openNavMenu = groupId;
+        this.navOpenedByHover = true;
+        this.syncNavMenus();
+      });
+      groupEl.addEventListener("pointerleave", (ev) => {
+        if (ev.pointerType !== "mouse") return;
+        if (this.openNavMenu === groupId) {
+          this.openNavMenu = null;
+          this.navOpenedByHover = false;
+          this.syncNavMenus();
+        }
+      });
+    });
+
+    this.root.querySelectorAll<HTMLButtonElement>("[data-nav-trigger]").forEach((btn) => {
+      btn.addEventListener("click", (ev) => {
+        ev.stopPropagation();
+        const groupId = btn.dataset.navTrigger as NavMenuGroup;
+        if (this.settingsOpen) {
+          this.settingsOpen = false;
+          this.syncSettingsPopover();
+        }
+        if (this.openNavMenu === groupId) {
+          if (this.navOpenedByHover) {
+            this.navOpenedByHover = false;
+          } else {
+            this.openNavMenu = null;
+          }
+        } else {
+          this.openNavMenu = groupId;
+          this.navOpenedByHover = false;
+        }
+        this.syncNavMenus();
+      });
+    });
+
+    this.root.querySelectorAll<HTMLButtonElement>("[data-nav-mode]").forEach((btn) => {
       btn.addEventListener("click", () => {
-        const nextMode = btn.dataset.mode as PlayMode;
+        const nextMode = btn.dataset.navMode as PlayMode;
         this.switchMode(nextMode);
+      });
+    });
+
+    this.root.querySelectorAll<HTMLButtonElement>("[data-nav-tool]").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const tool = btn.dataset.navTool as ToolMenuItem;
+        void this.selectToolItem(tool);
       });
     });
 
@@ -833,6 +1049,11 @@ class LimakhosApp {
 
     this.settingsBtnEl?.addEventListener("click", (ev) => {
       ev.stopPropagation();
+      if (this.openNavMenu !== null) {
+        this.openNavMenu = null;
+        this.navOpenedByHover = false;
+        this.syncNavMenus();
+      }
       this.settingsOpen = !this.settingsOpen;
       this.syncSettingsPopover();
     });
@@ -883,6 +1104,10 @@ class LimakhosApp {
         const tab = btn.dataset.underboardTab as "opening" | "fen";
         if (tab !== "opening" && tab !== "fen") return;
         this.underboardTab = tab;
+        if (this.mode === "analysis") {
+          this.activeToolItem = tab === "fen" ? "import" : this.activeToolItem === "import" ? "opening" : this.activeToolItem;
+          this.syncNavMenus();
+        }
         this.syncUnderboardTabs();
       });
     });
@@ -953,7 +1178,9 @@ class LimakhosApp {
 
     // Action bar
     this.root.querySelector("#btn-new")?.addEventListener("click", () => {
-      if (this.mode === "puzzles") {
+      if (this.mode === "basics") {
+        void this.loadBasicsStep(this.activeBasicsLessonIdx, this.activeBasicsStepIdx);
+      } else if (this.mode === "puzzles") {
         void this.loadPuzzle(this.activePuzzleIdx);
       } else if (this.mode === "practice") {
         void this.loadPracticeDrill(this.activeModuleIdx, this.activeDrillIdx);
@@ -965,7 +1192,7 @@ class LimakhosApp {
       this.leaveOnlineRoom(true);
     });
     this.root.querySelector("#btn-undo")?.addEventListener("click", () => void this.handleUndo());
-    this.root.querySelector("#btn-resign")?.addEventListener("click", () => this.handleResign());
+    this.root.querySelector("#btn-resign")?.addEventListener("click", () => this.handleResignClick());
 
     // FEN / PDN I/O
     this.root.querySelector("#btn-copy-fen")?.addEventListener("click", () => {
@@ -1009,12 +1236,14 @@ class LimakhosApp {
   }
 
   private async importPdnText(pdn: string, switchToAnalysis = false): Promise<void> {
+    this.clearResignConfirm(false);
     try {
       const res = await this.engine.importPdn(pdn);
       if (switchToAnalysis) {
         this.leaveOnlineRoom(false);
         this.mode = "analysis";
         this.analysisEnabled = true;
+        this.activeToolItem = "analysis";
         this.underboardTab = "opening";
         this.renderShell();
       }
@@ -1035,6 +1264,7 @@ class LimakhosApp {
   }
 
   private async startNewGame(customFen?: string): Promise<void> {
+    this.clearResignConfirm(false);
     this.stopClock();
     this.cancelAnalysis();
     this.forcedOutcome = null;
@@ -1099,6 +1329,12 @@ class LimakhosApp {
       if (!this.isAtLatestPly()) return false;
       return this.onlineRole === this.onlineState.side_to_move;
     }
+    if (this.mode === "basics") {
+      return (
+        this.isAtLatestPly() &&
+        (this.basicsStatus === "trying" || this.basicsStatus === "wrong")
+      );
+    }
     if (this.mode === "puzzles") {
       return (
         this.isAtLatestPly() &&
@@ -1125,8 +1361,13 @@ class LimakhosApp {
 
   private async handleUserMove(move: MoveDto): Promise<void> {
     if (!this.currentSnapshot || !this.canHumanMoveNow()) return;
+    this.clearResignConfirm();
     if (this.mode === "online") {
       this.onlineConn?.sendMove(move.long_notation);
+      return;
+    }
+    if (this.mode === "basics") {
+      await this.handleBasicsUserMove(move);
       return;
     }
     if (this.mode === "puzzles") {
@@ -1139,6 +1380,7 @@ class LimakhosApp {
 
   private async commitNotation(moveNotation: string): Promise<void> {
     if (!this.currentSnapshot) return;
+    this.clearResignConfirm(false);
     this.cancelAnalysis();
     const mover = this.currentSnapshot.side_to_move;
     const hashes = this.historyHashesUpTo(this.cursor);
@@ -1308,10 +1550,84 @@ class LimakhosApp {
     void this.triggerAnalysisIfEnabled();
   }
 
+  private canUndoNow(): boolean {
+    return !(
+      this.mode === "online" ||
+      this.mode === "puzzles" ||
+      this.mode === "basics" ||
+      this.cursor === 0 ||
+      this.aiThinking
+    );
+  }
+
+  private canResignNow(): boolean {
+    if (this.mode === "puzzles" || this.mode === "basics") return false;
+    if (this.effectiveOutcome().type !== "ongoing") return false;
+    if (this.mode === "online") {
+      return Boolean(
+        this.onlineRoomId &&
+          this.onlineRole !== "spectator" &&
+          this.onlineState?.status === "active",
+      );
+    }
+    return Boolean(this.currentSnapshot);
+  }
+
+  private clearResignConfirm(syncUi = true): void {
+    if (this.resignConfirmTimer !== null) {
+      clearTimeout(this.resignConfirmTimer);
+      this.resignConfirmTimer = null;
+    }
+    if (!this.resignConfirming) return;
+    this.resignConfirming = false;
+    if (syncUi) this.syncActionButtons();
+  }
+
+  private armResignConfirm(): void {
+    if (!this.canResignNow()) return;
+    if (this.resignConfirmTimer !== null) {
+      clearTimeout(this.resignConfirmTimer);
+    }
+    this.resignConfirming = true;
+    this.resignConfirmTimer = window.setTimeout(() => {
+      this.resignConfirmTimer = null;
+      if (this.resignConfirming) {
+        this.resignConfirming = false;
+        this.syncActionButtons();
+      }
+    }, 3500);
+    this.syncActionButtons();
+  }
+
+  private syncActionButtons(): void {
+    const t = this.t();
+    const undoBtn = this.root.querySelector<HTMLButtonElement>("#btn-undo");
+    if (undoBtn) {
+      undoBtn.disabled = !this.canUndoNow();
+    }
+    const resignBtn = this.root.querySelector<HTMLButtonElement>("#btn-resign");
+    if (resignBtn) {
+      const canResign = this.canResignNow();
+      if (!canResign && this.resignConfirming) {
+        this.clearResignConfirm(false);
+      }
+      resignBtn.disabled = !canResign;
+      resignBtn.classList.toggle("is-confirming", this.resignConfirming && canResign);
+      const nextHtml =
+        this.resignConfirming && canResign
+          ? `${ICONS.check}<span>${escapeHtml(t.confirmResign)}</span>`
+          : `${ICONS.resign}<span>${escapeHtml(t.resign)}</span>`;
+      if (resignBtn.innerHTML !== nextHtml) {
+        resignBtn.innerHTML = nextHtml;
+      }
+    }
+  }
+
   private async handleUndo(): Promise<void> {
-    if (this.mode === "online" || this.mode === "puzzles" || this.cursor === 0 || this.aiThinking) {
+    if (!this.canUndoNow()) {
       return;
     }
+    this.clearResignConfirm(false);
     const steps = (this.mode === "ai" || this.mode === "practice") && this.cursor >= 2 ? 2 : 1;
     this.timeline = this.timeline.slice(0, this.cursor - steps + 1);
     this.cursor = this.timeline.length - 1;
@@ -1319,14 +1635,31 @@ class LimakhosApp {
     await this.inspectCursor();
   }
 
-  private handleResign(): void {
+  private handleResignClick(): void {
+    if (!this.canResignNow()) {
+      this.clearResignConfirm();
+      return;
+    }
+    if (!this.resignConfirming) {
+      this.armResignConfirm();
+      return;
+    }
+    this.clearResignConfirm(false);
+    this.performResign();
+  }
+
+  private performResign(): void {
     if (this.mode === "online") {
       if (this.onlineRoomId && this.onlineRole !== "spectator") {
         this.onlineConn?.resign();
       }
+      this.syncActionButtons();
       return;
     }
-    if (!this.currentSnapshot || this.effectiveOutcome().type !== "ongoing") return;
+    if (!this.currentSnapshot || this.effectiveOutcome().type !== "ongoing") {
+      this.syncActionButtons();
+      return;
+    }
     const loser = this.mode === "ai" ? this.humanColor : this.currentSnapshot.side_to_move;
     this.forcedOutcome = {
       type: "win",
@@ -1340,10 +1673,24 @@ class LimakhosApp {
   }
 
   private handleKeydown(ev: KeyboardEvent): void {
-    if (ev.key === "Escape" && this.settingsOpen) {
-      this.settingsOpen = false;
-      this.syncSettingsPopover();
-      return;
+    if (ev.key === "Escape") {
+      let handled = false;
+      if (this.resignConfirming) {
+        this.clearResignConfirm();
+        handled = true;
+      }
+      if (this.openNavMenu !== null) {
+        this.openNavMenu = null;
+        this.navOpenedByHover = false;
+        this.syncNavMenus();
+        handled = true;
+      }
+      if (this.settingsOpen) {
+        this.settingsOpen = false;
+        this.syncSettingsPopover();
+        handled = true;
+      }
+      if (handled) return;
     }
     if (
       ev.target instanceof HTMLTextAreaElement ||
@@ -1560,6 +1907,7 @@ class LimakhosApp {
       this.onlineConn = null;
     }
     this.stopClock();
+    this.clearResignConfirm(false);
     this.onlineRoomId = null;
     this.onlineRole = null;
     this.onlineState = null;
@@ -1666,6 +2014,9 @@ class LimakhosApp {
   // --- Rendering ---
 
   private computeBoardArrows(): BoardArrow[] {
+    if (this.mode === "basics") {
+      return this.basicsHintArrow ? [this.basicsHintArrow] : [];
+    }
     if (this.mode === "puzzles") {
       return this.puzzleHintArrow ? [this.puzzleHintArrow] : [];
     }
@@ -1711,13 +2062,14 @@ class LimakhosApp {
     if (this.mode === "online") {
       this.renderOnlinePanel();
     }
-    if (this.mode === "puzzles" || this.mode === "practice") {
+    if (this.mode === "basics" || this.mode === "puzzles" || this.mode === "practice") {
       this.renderStudyPanel();
     }
     this.renderEvalBar();
     this.renderAnalysisPanel();
     this.renderOpeningPanel();
     this.renderMovesPanel();
+    this.syncActionButtons();
   }
 
   private renderPlayerBars(): void {
@@ -1750,7 +2102,7 @@ class LimakhosApp {
           <div class="player-info">
             <div class="player-name">
               <span class="color-dot is-${c}"></span>
-              <span>${name}</span>
+              <span class="player-name-text">${name}</span>
               ${ratingBadge}
               ${offlineBadge}
             </div>
@@ -1786,7 +2138,7 @@ class LimakhosApp {
         <div class="player-info">
           <div class="player-name">
             <span class="color-dot is-${c}"></span>
-            <span>${escapeHtml(labelFor(c))}</span>
+            <span class="player-name-text">${escapeHtml(labelFor(c))}</span>
           </div>
         </div>
         ${clockHtml}
@@ -2232,6 +2584,7 @@ class LimakhosApp {
     if (
       (this.mode === "online" && this.onlineState?.status === "active") ||
       this.mode === "puzzles" ||
+      this.mode === "basics" ||
       (this.mode === "practice" && !this.practiceLiveEval)
     ) {
       this.analysisPanelEl.style.display = "none";
@@ -2392,53 +2745,66 @@ class LimakhosApp {
     if (statsEl) {
       statsEl.hidden = !this.analysisEnabled;
       if (this.analysisEnabled) {
-        const nodesText = res ? res.nodes.toLocaleString() : "0";
-        const npsText = res ? nps.toLocaleString() : "0";
+        const nodesFull = res ? res.nodes.toLocaleString() : "0";
+        const npsFull = res ? nps.toLocaleString() : "0";
+        const nodesText = res ? formatCompactCount(res.nodes) : "0";
+        const npsText = res ? formatCompactCount(nps) : "0";
         const depthText = res ? `${res.depth}/${this.analysisDepth}` : `0/${this.analysisDepth}`;
         const timeText = res && this.lastAnalysisMs > 0 ? formatElapsedMs(this.lastAnalysisMs) : "—";
         statsEl.innerHTML = `
           <span>${escapeHtml(t.depth)}: <strong>${depthText}</strong></span>
-          <span><strong>${nodesText}</strong> ${escapeHtml(t.nodesExplored)}</span>
-          <span><strong>${npsText}</strong> ${escapeHtml(t.nps)}</span>
+          <span title="${nodesFull} ${escapeHtml(t.nodesExplored)}"><strong>${nodesText}</strong> ${escapeHtml(t.nodesExplored)}</span>
+          <span title="${npsFull} ${escapeHtml(t.nps)}"><strong>${npsText}</strong> ${escapeHtml(t.nps)}</span>
           <span><strong>${timeText}</strong></span>
         `;
       }
     }
 
     if (pvListEl) {
-      pvListEl.innerHTML =
-        this.analysisEnabled && res && snap && res.lines.length > 0
-          ? res.lines
-              .map((line) => {
-                const badge = formatEvalLight(line.score_light_cp, line.mate_in, snap.side_to_move);
-                const scoreCls = line.score_light_cp >= 0 ? "is-light" : "is-dark";
-                const bestToken = line.pv_notations[0] ?? "";
-                return `
-                  <button type="button" class="pv-row" data-pv-move="${escapeHtml(bestToken)}">
-                    <span class="pv-score ${scoreCls}">${badge}</span>
-                    <span class="pv-line">${escapeHtml(line.pv_notations.join("  "))}</span>
-                  </button>
-                `;
-              })
-              .join("")
-          : `<div style="padding:8px 10px;color:var(--text-muted);font-size:0.8rem;border-top:1px solid var(--border-subtle);">${
-              this.analysisEnabled ? (this.analysisBusy ? t.engineThinking : "—") : t.engineOff
-            }</div>`;
+      pvListEl.hidden = !this.analysisEnabled;
+      if (this.analysisEnabled) {
+        if (res && snap && res.lines.length > 0) {
+          const lines = res.lines.slice(0, 3);
+          const rowsHtml = lines
+            .map((line) => {
+              const badge = formatEvalLight(line.score_light_cp, line.mate_in, snap.side_to_move);
+              const scoreCls = line.score_light_cp >= 0 ? "is-light" : "is-dark";
+              const bestToken = line.pv_notations[0] ?? "";
+              return `
+                <button type="button" class="pv-row" data-pv-move="${escapeHtml(bestToken)}">
+                  <span class="pv-score ${scoreCls}">${badge}</span>
+                  <span class="pv-line">${escapeHtml(line.pv_notations.join("  "))}</span>
+                </button>
+              `;
+            })
+            .join("");
+          const emptyCount = Math.max(0, 3 - lines.length);
+          const fillersHtml = `<div class="pv-row is-empty" aria-hidden="true"></div>`.repeat(emptyCount);
+          pvListEl.innerHTML = `${rowsHtml}${fillersHtml}`;
+        } else {
+          pvListEl.innerHTML = `<div class="pv-placeholder">${escapeHtml(
+            this.analysisBusy ? t.engineThinking : "—",
+          )}</div>`;
+        }
 
-      pvListEl.querySelectorAll<HTMLButtonElement>("[data-pv-move]").forEach((btn) => {
-        btn.addEventListener("click", () => {
-          const tok = btn.dataset.pvMove;
-          if (tok && this.canHumanMoveNow()) {
-            void this.commitNotation(tok);
-          }
+        pvListEl.querySelectorAll<HTMLButtonElement>("[data-pv-move]").forEach((btn) => {
+          btn.addEventListener("click", () => {
+            const tok = btn.dataset.pvMove;
+            if (tok && this.canHumanMoveNow()) {
+              void this.commitNotation(tok);
+            }
+          });
         });
-      });
+      } else {
+        pvListEl.innerHTML = "";
+      }
     }
   }
 
   private async loadOpeningLine(lineId: string): Promise<void> {
     const line = OPENING_BOOK.find((l) => l.id === lineId);
     if (!line) return;
+    this.clearResignConfirm(false);
     this.cancelAnalysis();
     void this.engine.clearCache();
     this.stopClock();
@@ -2624,6 +2990,7 @@ class LimakhosApp {
     if (navPrev) navPrev.disabled = atStart;
     if (navNext) navNext.disabled = atEnd;
     if (navEnd) navEnd.disabled = atEnd;
+    this.syncActionButtons();
 
     // Auto-scroll current move inside .moves-wrap only (never jumps outer page)
     const wrap = this.movesPanelEl.querySelector<HTMLElement>(".moves-wrap");
@@ -2673,6 +3040,7 @@ class LimakhosApp {
     const seq = ++this.puzzleRunSeq;
 
     this.stopClock();
+    this.clearResignConfirm(false);
     this.cancelAnalysis();
     this.forcedOutcome = null;
     this.aiThinking = false;
@@ -2826,6 +3194,7 @@ class LimakhosApp {
   }
 
   private async loadPracticeDrill(moduleIdx: number, drillIdx: number): Promise<void> {
+    this.clearResignConfirm(false);
     this.activeModuleIdx = Math.max(0, Math.min(PRACTICE_MODULES.length - 1, moduleIdx));
     const mod = this.activePracticeModule();
     this.activeDrillIdx = Math.max(0, Math.min(mod.drills.length - 1, drillIdx));
@@ -2841,6 +3210,132 @@ class LimakhosApp {
       this.studyProgress.completedDrills.push(drillId);
       this.saveStudyProgress();
     }
+  }
+
+  private activeBasicsLesson(): BasicsLesson {
+    return BASICS_LESSONS[this.activeBasicsLessonIdx] ?? BASICS_LESSONS[0];
+  }
+
+  private activeBasicsStep(): BasicsLessonStep {
+    const lesson = this.activeBasicsLesson();
+    return lesson.steps[this.activeBasicsStepIdx] ?? lesson.steps[0];
+  }
+
+  private markBasicsStepCompleted(stepId: string): void {
+    if (!this.studyProgress.completedBasics.includes(stepId)) {
+      this.studyProgress.completedBasics.push(stepId);
+      this.saveStudyProgress();
+    }
+  }
+
+  private async loadBasicsStep(lessonIdx: number, stepIdx: number): Promise<void> {
+    const safeLessonIdx =
+      ((lessonIdx % BASICS_LESSONS.length) + BASICS_LESSONS.length) % BASICS_LESSONS.length;
+    const lesson = BASICS_LESSONS[safeLessonIdx];
+    const safeStepIdx = Math.max(0, Math.min(lesson.steps.length - 1, stepIdx));
+
+    this.activeBasicsLessonIdx = safeLessonIdx;
+    this.activeBasicsStepIdx = safeStepIdx;
+    this.basicsStatus = "trying";
+    this.basicsShowHint = false;
+    this.basicsHintArrow = null;
+    const seq = ++this.basicsRunSeq;
+
+    this.stopClock();
+    this.clearResignConfirm(false);
+    this.cancelAnalysis();
+    this.forcedOutcome = null;
+    this.aiThinking = false;
+    this.lastAnalysis = null;
+    this.lastAnalysisMs = 0;
+
+    const step = lesson.steps[safeStepIdx];
+    const snap = await this.engine.inspect(step.fen);
+    if (seq !== this.basicsRunSeq || this.mode !== "basics") return;
+
+    this.orientation = snap.side_to_move;
+    this.timeline = [{ fen: snap.fen, hash: snap.hash, notation: null, lastMove: null }];
+    this.cursor = 0;
+    this.currentSnapshot = snap;
+    this.syncBoard();
+    this.refreshPanels();
+  }
+
+  private async handleBasicsUserMove(move: MoveDto): Promise<void> {
+    if (!this.currentSnapshot) return;
+    const step = this.activeBasicsStep();
+    const isMatch = step.acceptedMoves.some(
+      (tok) =>
+        tok === move.long_notation ||
+        tok === move.notation ||
+        tok === move.short_notation,
+    );
+
+    if (!isMatch) {
+      this.basicsStatus = "wrong";
+      this.syncBoard();
+      this.renderStudyPanel();
+      return;
+    }
+
+    this.basicsHintArrow = null;
+    this.basicsShowHint = false;
+    const seq = ++this.basicsRunSeq;
+    await this.commitNotation(move.long_notation);
+    if (seq !== this.basicsRunSeq || this.mode !== "basics") return;
+
+    this.markBasicsStepCompleted(step.id);
+    this.basicsStatus = "completed";
+    this.syncBoard();
+    this.renderStudyPanel();
+  }
+
+  private showBasicsHint(): void {
+    if (!this.currentSnapshot || this.mode !== "basics") return;
+    const step = this.activeBasicsStep();
+    if (step.demoArrow) {
+      this.basicsHintArrow = {
+        from: step.demoArrow.from,
+        to: step.demoArrow.to,
+        path: step.demoArrow.path,
+        color: "#e68f00",
+        opacity: 0.9,
+        width: 14,
+      };
+    } else {
+      const targetTok = step.acceptedMoves[0];
+      const match = targetTok
+        ? this.currentSnapshot.legal_moves.find(
+            (m) =>
+              m.long_notation === targetTok ||
+              m.notation === targetTok ||
+              m.short_notation === targetTok,
+          )
+        : undefined;
+      if (match) {
+        this.basicsHintArrow = {
+          from: match.from,
+          to: match.to,
+          path: match.path,
+          color: "#e68f00",
+          opacity: 0.9,
+          width: 14,
+        };
+      }
+    }
+    this.basicsShowHint = true;
+    this.syncBoard();
+    this.renderStudyPanel();
+  }
+
+  private advanceBasicsStep(): void {
+    const lesson = this.activeBasicsLesson();
+    if (this.activeBasicsStepIdx + 1 < lesson.steps.length) {
+      void this.loadBasicsStep(this.activeBasicsLessonIdx, this.activeBasicsStepIdx + 1);
+      return;
+    }
+    const nextLessonIdx = (this.activeBasicsLessonIdx + 1) % BASICS_LESSONS.length;
+    void this.loadBasicsStep(nextLessonIdx, 0);
   }
 
   private async showPracticeHint(): Promise<void> {
@@ -2879,6 +3374,125 @@ class LimakhosApp {
     if (!this.studyPanelEl) return;
     const t = this.t();
     const isTh = this.locale === "th";
+
+    if (this.mode === "basics") {
+      const lesson = this.activeBasicsLesson();
+      const step = this.activeBasicsStep();
+      const totalSteps = BASICS_LESSONS.reduce((acc, l) => acc + l.steps.length, 0);
+      const completedCount = BASICS_LESSONS.reduce(
+        (acc, l) =>
+          acc + l.steps.filter((s) => this.studyProgress.completedBasics.includes(s.id)).length,
+        0,
+      );
+      const stepDone = this.studyProgress.completedBasics.includes(step.id);
+      const allDone = completedCount >= totalSteps;
+
+      let feedbackHtml = `<div class="study-feedback">${escapeHtml(
+        isTh ? step.promptTh : step.promptEn,
+      )}</div>`;
+      if (this.basicsStatus === "wrong") {
+        feedbackHtml = `<div class="study-feedback is-bad">${escapeHtml(t.basicsWrong)}</div>`;
+      } else if (this.basicsStatus === "completed") {
+        feedbackHtml = `<div class="study-feedback is-good">${escapeHtml(
+          allDone ? t.basicsAllDone : t.basicsCorrect,
+        )}</div>`;
+      } else if (this.basicsShowHint) {
+        feedbackHtml = `<div class="study-feedback is-hint">${escapeHtml(
+          isTh ? step.hintTh : step.hintEn,
+        )}</div>`;
+      }
+
+      const curriculumHtml = BASICS_LESSONS.map((l, lIdx) => {
+        const lDoneCount = l.steps.filter((s) =>
+          this.studyProgress.completedBasics.includes(s.id),
+        ).length;
+        const lAllDone = lDoneCount === l.steps.length;
+        const lActive = lIdx === this.activeBasicsLessonIdx;
+
+        const stepsHtml = l.steps
+          .map((s, sIdx) => {
+            const sDone = this.studyProgress.completedBasics.includes(s.id);
+            const sActive = lActive && sIdx === this.activeBasicsStepIdx;
+            return `
+              <button
+                type="button"
+                class="basics-step-btn ${sActive ? "is-active" : ""} ${sDone ? "is-done" : ""}"
+                data-basics-lesson="${lIdx}"
+                data-basics-step="${sIdx}"
+              >
+                <span>${sDone ? "✓ " : ""}${escapeHtml(isTh ? s.titleTh : s.titleEn)}</span>
+                <span class="badge-muted">${sIdx + 1}/${l.steps.length}</span>
+              </button>
+            `;
+          })
+          .join("");
+
+        return `
+          <div class="basics-lesson-group">
+            <button
+              type="button"
+              class="basics-lesson-head ${lActive ? "is-active" : ""} ${lAllDone ? "is-done" : ""}"
+              data-basics-lesson="${lIdx}"
+              data-basics-step="0"
+            >
+              <span>${lAllDone ? "✓ " : ""}${lIdx + 1}. ${escapeHtml(isTh ? l.titleTh : l.titleEn)}</span>
+              <span class="badge-muted">${lDoneCount}/${l.steps.length}</span>
+            </button>
+            <div class="basics-steps-row">${stepsHtml}</div>
+          </div>
+        `;
+      }).join("");
+
+      this.studyPanelEl.innerHTML = `
+        <div class="li-box">
+          <div class="li-box-header">
+            <h2 class="li-box-title">${ICONS.basics} <span>${escapeHtml(t.basicsTitle)}</span></h2>
+            <span class="li-badge is-good">${escapeHtml(t.basicsCompleted)}: ${completedCount}/${totalSteps}</span>
+          </div>
+          <div class="li-box-body">
+            <div class="basics-meta-row">
+              <span class="li-badge is-accent">${escapeHtml(t.basicsLessonLabel)} ${this.activeBasicsLessonIdx + 1}/${BASICS_LESSONS.length} • ${escapeHtml(t.basicsStepLabel)} ${this.activeBasicsStepIdx + 1}/${lesson.steps.length}</span>
+              <span class="badge-muted">${escapeHtml(isTh ? lesson.titleTh : lesson.titleEn)}</span>
+            </div>
+            <h3 class="basics-step-title">${stepDone ? "✓ " : ""}${escapeHtml(isTh ? step.titleTh : step.titleEn)}</h3>
+            <p class="basics-explanation">${escapeHtml(isTh ? step.explanationTh : step.explanationEn)}</p>
+            ${feedbackHtml}
+            <div class="inline-row">
+              <button type="button" class="li-btn is-sm" id="btn-basics-hint" ${this.basicsStatus === "completed" ? "disabled" : ""}>${ICONS.hint} <span>${escapeHtml(t.basicsHint)}</span></button>
+              <button type="button" class="li-btn is-sm" id="btn-basics-retry">${ICONS.refresh} <span>${escapeHtml(t.basicsRetry)}</span></button>
+              <button type="button" class="li-btn is-sm ${this.basicsStatus === "completed" ? "is-primary" : ""}" id="btn-basics-next"><span>${escapeHtml(t.basicsNext)}</span> ${ICONS.next}</button>
+            </div>
+          </div>
+        </div>
+        <div class="li-box">
+          <div class="li-box-header">
+            <h2 class="li-box-title">${escapeHtml(t.basicsLessonLabel)} 1–${BASICS_LESSONS.length}</h2>
+            <span class="badge-muted">${completedCount}/${totalSteps}</span>
+          </div>
+          <div class="basics-curriculum">${curriculumHtml}</div>
+        </div>
+      `;
+
+      this.studyPanelEl.querySelector("#btn-basics-hint")?.addEventListener("click", () => {
+        this.showBasicsHint();
+      });
+      this.studyPanelEl.querySelector("#btn-basics-retry")?.addEventListener("click", () => {
+        void this.loadBasicsStep(this.activeBasicsLessonIdx, this.activeBasicsStepIdx);
+      });
+      this.studyPanelEl.querySelector("#btn-basics-next")?.addEventListener("click", () => {
+        this.advanceBasicsStep();
+      });
+      this.studyPanelEl
+        .querySelectorAll<HTMLButtonElement>("[data-basics-lesson]")
+        .forEach((btn) => {
+          btn.addEventListener("click", () => {
+            const lIdx = Number(btn.dataset.basicsLesson);
+            const sIdx = Number(btn.dataset.basicsStep ?? 0);
+            void this.loadBasicsStep(lIdx, sIdx);
+          });
+        });
+      return;
+    }
 
     if (this.mode === "puzzles") {
       const puzzle = this.activePuzzle();
