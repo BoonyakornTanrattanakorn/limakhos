@@ -77,7 +77,7 @@ export class MakhosEngineClient {
     }
     this.compilePromise = (async () => {
       try {
-        const res = await fetch("/wasm/makhos_wasm.wasm");
+        const res = await fetch(`${import.meta.env.BASE_URL}wasm/makhos_wasm.wasm`);
         if (!res.ok) return null;
         const bytes = await res.arrayBuffer();
         const mod = await WebAssembly.compile(bytes);

@@ -46,7 +46,7 @@ async function loadWasm(): Promise<WasmExports> {
         if (precompiledModule) {
           instance = await WebAssembly.instantiate(precompiledModule, imports);
         } else {
-          const url = "/wasm/makhos_wasm.wasm";
+          const url = `${import.meta.env.BASE_URL}wasm/makhos_wasm.wasm`;
           const res = await fetch(url);
           if (!res.ok) {
             throw new Error(`Failed to fetch ${url} (HTTP ${res.status})`);
