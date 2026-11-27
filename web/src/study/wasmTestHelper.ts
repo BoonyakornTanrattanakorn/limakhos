@@ -22,6 +22,7 @@ export async function loadNodeWasm(): Promise<WasmExports> {
   const instantiated = await WebAssembly.instantiate(bytes, {
     env: {
       host_now_ms: () => performance.now(),
+      host_should_abort: () => 0,
       host_on_progress: (ptr: number, len: number) => {
         if (!activeProgressHandler || !cachedExports) return;
         const slice = new Uint8Array(cachedExports.memory.buffer, ptr, len).slice();

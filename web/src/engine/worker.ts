@@ -8,13 +8,14 @@ interface WasmExports {
 }
 
 type WorkerInbound =
-  | { type: "init"; module: WebAssembly.Module }
+  | { type: "init"; module?: WebAssembly.Module; abortBuffer?: SharedArrayBuffer }
   | { id: number; req: unknown };
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
 
 let precompiledModule: WebAssembly.Module | null = null;
+let abortView: Int32Array | null = null;
 let wasmExports: WasmExports | null = null;
 let exportsPromise: Promise<WasmExports> | null = null;
 let activeRequestId: number | null = null;
@@ -23,6 +24,7 @@ function buildImports(): WebAssembly.Imports {
   return {
     env: {
       host_now_ms: () => performance.now(),
+      host_should_abort: () => (abortView && Atomics.load(abortView, 0) !== 0 ? 1 : 0),
       host_on_progress: (ptr: number, len: number) => {
         if (activeRequestId === null || !wasmExports) return;
         try {
@@ -85,7 +87,8 @@ function callDispatch(wasm: WasmExports, payload: string): string {
 self.onmessage = async (ev: MessageEvent<WorkerInbound>) => {
   const data = ev.data;
   if ("type" in data) {
-    precompiledModule = data.module;
+    if (data.module) precompiledModule = data.module;
+    if (data.abortBuffer) abortView = new Int32Array(data.abortBuffer);
     void loadWasm().catch(() => {});
     return;
   }

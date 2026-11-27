@@ -140,6 +140,10 @@ pub struct SearchConfig {
     /// Optional subset of root moves (long notation) for parallel worker splitting.
     #[serde(default)]
     pub root_moves: Option<Vec<String>>,
+    /// Continue iterative deepening from the previous search depth when the
+    /// engine's cached state matches this position, history, root moves, and multipv.
+    #[serde(default)]
+    pub resume: bool,
 }
 
 impl Default for SearchConfig {
@@ -151,6 +155,7 @@ impl Default for SearchConfig {
             multipv: 1,
             history_hashes: Vec::new(),
             root_moves: None,
+            resume: false,
         }
     }
 }
@@ -184,6 +189,18 @@ pub struct SearchProgress<'a> {
     pub lines: Option<&'a [AnalysisLine]>,
 }
 
+#[derive(Clone, Debug)]
+struct LastSearchState {
+    pos_hash: u64,
+    history_hashes: Vec<u64>,
+    root_moves: Option<Vec<String>>,
+    multipv: usize,
+    completed_depth: u8,
+    nodes: u64,
+    lines: Vec<AnalysisLine>,
+    finished_early: bool,
+}
+
 pub struct Engine {
     tt: TranspositionTable,
     /// Persistent history heuristic table `[side][from_sq][to_sq]` decayed across searches.
@@ -194,6 +211,7 @@ pub struct Engine {
     cont2_hist: Box<[[[i16; 64]; 64]; 2]>,
     /// Countermove table `[prev_from][prev_to] -> (reply_from, reply_to)`.
     countermoves: [[(u8, u8); 33]; 33],
+    last_search: Option<LastSearchState>,
 }
 
 impl Default for Engine {
@@ -210,6 +228,7 @@ impl Engine {
             cont1_hist: zero_cont_table(),
             cont2_hist: zero_cont_table(),
             countermoves: [[(0, 0); 33]; 33],
+            last_search: None,
         }
     }
 
@@ -219,6 +238,7 @@ impl Engine {
         self.cont1_hist.fill([[0; 64]; 64]);
         self.cont2_hist.fill([[0; 64]; 64]);
         self.countermoves = [[(0, 0); 33]; 33];
+        self.last_search = None;
     }
 
     fn decay_history(&mut self) {
@@ -285,6 +305,18 @@ impl Engine {
         now_ms: Option<&dyn Fn() -> f64>,
         on_progress: Option<&mut dyn FnMut(SearchProgress<'_>)>,
     ) -> AnalysisResult {
+        self.analyze_with_controls(pos, config, tb, now_ms, on_progress, None)
+    }
+
+    pub fn analyze_with_controls(
+        &mut self,
+        pos: &Position,
+        config: &SearchConfig,
+        tb: Option<&dyn TablebaseProbe>,
+        now_ms: Option<&dyn Fn() -> f64>,
+        on_progress: Option<&mut dyn FnMut(SearchProgress<'_>)>,
+        should_abort: Option<&dyn Fn() -> bool>,
+    ) -> AnalysisResult {
         let all_legal = pos.legal_moves();
         if all_legal.is_empty() {
             return AnalysisResult {
@@ -322,14 +354,47 @@ impl Engine {
             }
         }
 
-        self.tt.new_search();
-        self.decay_history();
-
         let target_pv_count = config.multipv.max(1).min(allowed_count);
         let max_depth = config.max_depth.max(1);
         let max_nodes = config.max_nodes.unwrap_or(u64::MAX);
         let start_ms = now_ms.map(|f| f()).unwrap_or(0.0);
         let tb_max_pieces = tb.map(|t| t.max_pieces()).unwrap_or(0);
+
+        let resume_state = if config.resume {
+            self.last_search
+                .as_ref()
+                .filter(|s| {
+                    s.pos_hash == pos.hash
+                        && s.history_hashes == config.history_hashes
+                        && s.root_moves == config.root_moves
+                        && s.multipv == target_pv_count
+                })
+                .cloned()
+        } else {
+            None
+        };
+
+        if let Some(ref prev) = resume_state {
+            if prev.finished_early || prev.completed_depth >= max_depth {
+                if let Some(cb) = on_progress {
+                    cb(SearchProgress {
+                        depth: prev.completed_depth,
+                        nodes: prev.nodes,
+                        lines: Some(&prev.lines),
+                    });
+                }
+                return AnalysisResult {
+                    depth: prev.completed_depth,
+                    nodes: prev.nodes,
+                    lines: prev.lines.clone(),
+                };
+            }
+        }
+
+        if resume_state.is_none() {
+            self.tt.new_search();
+            self.decay_history();
+        }
 
         let mut path_hashes = [0u64; MAX_PATH];
         let mut path_len = 0usize;
@@ -345,18 +410,31 @@ impl Engine {
             path_len += 1;
         }
 
+        let (base_nodes, mut completed_depth, mut best_lines) = match resume_state {
+            Some(prev) => (prev.nodes, prev.completed_depth, prev.lines),
+            None => (0, 0, Vec::new()),
+        };
+        let mut prev_pv_order: Vec<(u8, u8)> = best_lines
+            .iter()
+            .map(|l| (l.best_move.from.number(), l.best_move.to.number()))
+            .collect();
+        let mut prev_pv_scores: Vec<i32> = best_lines.iter().map(|l| l.score_cp).collect();
+        let start_depth = completed_depth.saturating_add(1);
+
         let mut ctx = SearchContext {
             tt: &mut self.tt,
             tb,
             tb_max_pieces,
             root_in_tb,
+            base_nodes,
             nodes: 0,
             max_nodes,
             start_ms,
             last_progress_ms: start_ms,
             max_time_ms: config.max_time_ms,
             now_ms,
-            completed_depth: 0,
+            should_abort,
+            completed_depth,
             on_progress,
             aborted: false,
             path_hashes,
@@ -371,12 +449,17 @@ impl Engine {
             lmr_table: lmr_table(),
         };
 
-        let mut completed_depth = 0u8;
-        let mut best_lines: Vec<AnalysisLine> = Vec::new();
-        let mut prev_pv_order: Vec<(u8, u8)> = Vec::new();
-        let mut prev_pv_scores: Vec<i32> = Vec::new();
+        if start_depth > 1 {
+            if let Some(cb) = ctx.on_progress.as_deref_mut() {
+                cb(SearchProgress {
+                    depth: completed_depth,
+                    nodes: ctx.base_nodes,
+                    lines: Some(&best_lines),
+                });
+            }
+        }
 
-        for depth in 1..=max_depth {
+        for depth in start_depth..=max_depth {
             if depth > 1 && ctx.check_abort() {
                 break;
             }
@@ -440,7 +523,7 @@ impl Engine {
                     if let Some(cb) = ctx.on_progress.as_deref_mut() {
                         cb(SearchProgress {
                             depth: completed_depth,
-                            nodes: ctx.nodes,
+                            nodes: ctx.base_nodes + ctx.nodes,
                             lines: Some(&best_lines),
                         });
                     }
@@ -463,9 +546,29 @@ impl Engine {
             }
         }
 
+        let total_nodes = ctx.base_nodes + ctx.nodes;
+        let finished_early = !ctx.aborted
+            && ((config.root_moves.is_none() && all_legal.len() == 1 && completed_depth >= 4)
+                || (target_pv_count == 1
+                    && best_lines
+                        .first()
+                        .map(|l| l.score_cp.abs() > MATE_THRESHOLD)
+                        .unwrap_or(false)));
+
+        self.last_search = Some(LastSearchState {
+            pos_hash: pos.hash,
+            history_hashes: config.history_hashes.clone(),
+            root_moves: config.root_moves.clone(),
+            multipv: target_pv_count,
+            completed_depth,
+            nodes: total_nodes,
+            lines: best_lines.clone(),
+            finished_early,
+        });
+
         AnalysisResult {
             depth: completed_depth,
-            nodes: ctx.nodes,
+            nodes: total_nodes,
             lines: best_lines,
         }
     }
@@ -476,12 +579,14 @@ struct SearchContext<'a, 'p> {
     tb: Option<&'a dyn TablebaseProbe>,
     tb_max_pieces: u8,
     root_in_tb: bool,
+    base_nodes: u64,
     nodes: u64,
     max_nodes: u64,
     start_ms: f64,
     last_progress_ms: f64,
     max_time_ms: Option<u64>,
     now_ms: Option<&'a dyn Fn() -> f64>,
+    should_abort: Option<&'a dyn Fn() -> bool>,
     completed_depth: u8,
     on_progress: Option<&'p mut dyn FnMut(SearchProgress<'_>)>,
     aborted: bool,
@@ -515,6 +620,12 @@ impl<'a, 'p> SearchContext<'a, 'p> {
 
     #[inline]
     fn check_abort(&mut self) -> bool {
+        if let Some(abort_fn) = self.should_abort {
+            if abort_fn() {
+                self.aborted = true;
+                return true;
+            }
+        }
         if self.nodes >= self.max_nodes {
             self.aborted = true;
             return true;
@@ -532,7 +643,7 @@ impl<'a, 'p> SearchContext<'a, 'p> {
                 if let Some(cb) = self.on_progress.as_deref_mut() {
                     cb(SearchProgress {
                         depth: self.completed_depth,
-                        nodes: self.nodes,
+                        nodes: self.base_nodes + self.nodes,
                         lines: None,
                     });
                 }

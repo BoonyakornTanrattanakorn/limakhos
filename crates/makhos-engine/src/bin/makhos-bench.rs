@@ -169,6 +169,7 @@ fn main() {
             multipv: case.multipv,
             history_hashes: Vec::new(),
             root_moves: None,
+            resume: false,
         };
 
         // 1 warmup + 3 timed runs -> median time
@@ -231,6 +232,7 @@ fn main() {
             multipv: case.multipv,
             history_hashes: Vec::new(),
             root_moves: None,
+            resume: false,
         };
 
         let mut engine = Engine::new();

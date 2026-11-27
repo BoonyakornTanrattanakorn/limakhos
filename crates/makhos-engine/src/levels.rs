@@ -143,6 +143,7 @@ pub fn choose_ai_move_with_tb(
         multipv,
         history_hashes: history_hashes.to_vec(),
         root_moves: None,
+        resume: false,
     };
 
     let result = engine.analyze_with_tb(pos, &cfg, tb);

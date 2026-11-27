@@ -107,6 +107,7 @@ mod tests {
                 multipv: 3,
                 history_hashes: Vec::new(),
                 root_moves: Some(vec!["6-10".to_string(), "7-11".to_string()]),
+                resume: false,
             },
         );
         assert_eq!(res.lines.len(), 2);
@@ -201,5 +202,46 @@ mod tests {
             "Expected upgraded alpha-beta pruning to search < 45,000 nodes at depth 8, got {}",
             res.nodes
         );
+    }
+
+    #[test]
+    fn resume_continues_from_previous_depth_without_researching_earlier_depths() {
+        let mut engine = Engine::new();
+        let start = Position::start();
+        let r1 = engine.analyze(
+            &start,
+            &SearchConfig {
+                max_depth: 5,
+                max_nodes: None,
+                multipv: 2,
+                history_hashes: Vec::new(),
+                ..Default::default()
+            },
+        );
+        assert_eq!(r1.depth, 5);
+
+        let mut seen_depths = Vec::new();
+        let mut cb = |p: SearchProgress<'_>| {
+            if p.lines.is_some() {
+                seen_depths.push(p.depth);
+            }
+        };
+        let r2 = engine.analyze_with_progress(
+            &start,
+            &SearchConfig {
+                max_depth: 7,
+                max_nodes: None,
+                multipv: 2,
+                history_hashes: Vec::new(),
+                resume: true,
+                ..Default::default()
+            },
+            None,
+            None,
+            Some(&mut cb),
+        );
+        assert_eq!(seen_depths, vec![5, 6, 7]);
+        assert_eq!(r2.depth, 7);
+        assert!(r2.nodes >= r1.nodes);
     }
 }

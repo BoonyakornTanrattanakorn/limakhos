@@ -51,6 +51,7 @@ const LS_TOKEN_KEY = "limakhos_auth_token";
 const LS_GUEST_KEY = "limakhos_guest_name";
 const LS_STUDY_PROGRESS_KEY = "limakhos_study_progress_v1";
 const BLACK_FIRST_START_FEN = "B:W1,2,3,4,5,6,7,8:B25,26,27,28,29,30,31,32";
+const MAX_ANALYSIS_DEPTH = 48;
 
 /** Discrete time-limit steps for the analysis slider; 0 at the right end means unlimited (∞). */
 const ANALYSIS_TIME_STEPS_MS = [
@@ -62,6 +63,10 @@ function formatAnalysisTime(ms: number): string {
   if (ms < 1000) return `${ms}ms`;
   const secs = ms / 1000;
   return Number.isInteger(secs) ? `${secs}s` : `${secs.toFixed(1)}s`;
+}
+
+function effectiveAnalysisTimeMs(ms: number): number {
+  return ms <= 0 ? Number.POSITIVE_INFINITY : ms;
 }
 
 function timeMsToSliderIndex(ms: number): number {
@@ -155,14 +160,26 @@ class LimakhosApp {
   private onlineSubTab: "lobby" | "leaderboard" | "recent" = "lobby";
 
   private analysisEnabled = true;
-  private analysisThreads = 1;
+  private analysisThreads = 8;
   private analysisDepth = 10;
   private analysisTimeMs = 1500;
+  private committedAnalysisThreads = this.analysisThreads;
+  private committedAnalysisDepth = this.analysisDepth;
+  private committedAnalysisTimeMs = this.analysisTimeMs;
+  private activeWorkerMaxDepth = this.analysisDepth;
+  private activeWorkerMaxTimeMs = this.analysisTimeMs;
   private analysisMultiPv = 3;
   private analysisSeq = 0;
   private analysisBusy = false;
+  private analysisStartPerf = 0;
+  private analysisDeadlineTimer: number | null = null;
+  private lastAnalysisFen: string | null = null;
   private lastAnalysis: AnalysisResult | null = null;
   private lastAnalysisMs = 0;
+  private lastAnalysisStopReason: "depth" | "timeout" | "solved" | null = null;
+  private lastAnalysisRunTimeMs = this.analysisTimeMs;
+  private lastAnalysisRunThreads = this.analysisThreads;
+  private lastAnalysisCanResume = false;
   private aiThinking = false;
 
   private timeline: HistoryEntry[] = [];
@@ -1455,17 +1472,75 @@ class LimakhosApp {
     }
   }
 
-  private cancelAnalysis(): void {
-    this.analysisSeq += 1;
-    this.analysisBusy = false;
-    this.engine.cancelAnalysis();
+  private clearAnalysisDeadlineTimer(): void {
+    if (this.analysisDeadlineTimer !== null) {
+      clearTimeout(this.analysisDeadlineTimer);
+      this.analysisDeadlineTimer = null;
+    }
   }
 
-  private async triggerAnalysisIfEnabled(): Promise<void> {
+  private scheduleAnalysisDeadline(delayMs: number): void {
+    this.clearAnalysisDeadlineTimer();
+    this.analysisDeadlineTimer = window.setTimeout(() => {
+      this.analysisDeadlineTimer = null;
+      if (!this.analysisBusy) return;
+      if (this.lastAnalysis && this.lastAnalysis.lines.length > 0) {
+        this.stopRunningAnalysisKeepResult("timeout");
+      }
+    }, Math.max(0, Math.round(delayMs)));
+  }
+
+  private stopRunningAnalysisKeepResult(reason: "depth" | "timeout"): void {
+    this.lastAnalysisStopReason = reason;
+    this.lastAnalysisRunTimeMs =
+      reason === "timeout"
+        ? Math.max(this.committedAnalysisTimeMs, this.lastAnalysisMs)
+        : this.committedAnalysisTimeMs;
+    this.lastAnalysisRunThreads = this.committedAnalysisThreads;
+    this.clearAnalysisDeadlineTimer();
+    this.analysisSeq += 1;
+    this.analysisBusy = false;
+    this.lastAnalysisCanResume = this.engine.stopAnalysisSoft();
+    this.board.setArrows(this.computeBoardArrows());
+    this.renderAnalysisPanel();
+    this.renderEvalBar();
+  }
+
+  private shouldRecalculateWhenIdle(): boolean {
+    if (!this.analysisEnabled || !this.currentSnapshot) return false;
+    if (this.effectiveOutcome().type !== "ongoing") return false;
+    const res = this.lastAnalysis;
+    if (!res) return true;
+    if (res.depth >= this.analysisDepth) return false;
+    if (this.lastAnalysisStopReason === "solved") return false;
+    if (this.lastAnalysisStopReason === "timeout") {
+      return (
+        effectiveAnalysisTimeMs(this.analysisTimeMs) >
+        effectiveAnalysisTimeMs(this.lastAnalysisRunTimeMs)
+      );
+    }
+    return true;
+  }
+
+  private cancelAnalysis(): void {
+    this.clearAnalysisDeadlineTimer();
+    this.analysisSeq += 1;
+    const wasBusy = this.analysisBusy;
+    this.analysisBusy = false;
+    const preserved = this.engine.stopAnalysisSoft();
+    if (wasBusy && !preserved) {
+      this.lastAnalysisCanResume = false;
+    }
+  }
+
+  private async triggerAnalysisIfEnabled(resume = false): Promise<void> {
     if (this.mode === "online" && this.onlineState?.status === "active") {
       this.cancelAnalysis();
+      this.lastAnalysisFen = null;
       this.lastAnalysis = null;
       this.lastAnalysisMs = 0;
+      this.lastAnalysisStopReason = null;
+      this.lastAnalysisCanResume = false;
       this.renderAnalysisPanel();
       this.renderEvalBar();
       return;
@@ -1476,8 +1551,11 @@ class LimakhosApp {
     }
     if (this.effectiveOutcome().type !== "ongoing") {
       this.cancelAnalysis();
+      this.lastAnalysisFen = null;
       this.lastAnalysis = null;
       this.lastAnalysisMs = 0;
+      this.lastAnalysisStopReason = null;
+      this.lastAnalysisCanResume = false;
       this.board.setArrows(this.computeBoardArrows());
       this.renderAnalysisPanel();
       this.renderEvalBar();
@@ -1487,45 +1565,112 @@ class LimakhosApp {
     const seq = ++this.analysisSeq;
     const fen = this.currentSnapshot.fen;
     const hashes = this.historyHashesUpTo(this.cursor);
+    const samePositionRestart = this.lastAnalysisFen === fen && this.lastAnalysis !== null;
+    const canResume =
+      resume &&
+      samePositionRestart &&
+      this.lastAnalysisCanResume &&
+      this.lastAnalysisRunThreads === this.analysisThreads;
+    const baseElapsedMs = canResume ? this.lastAnalysisMs : 0;
+    const requestedMaxTimeMs =
+      this.analysisTimeMs > 0
+        ? canResume
+          ? Math.max(150, this.analysisTimeMs - baseElapsedMs)
+          : this.analysisTimeMs
+        : undefined;
+
+    this.lastAnalysisFen = fen;
+    this.committedAnalysisThreads = this.analysisThreads;
+    this.committedAnalysisDepth = this.analysisDepth;
+    this.committedAnalysisTimeMs = this.analysisTimeMs;
+    this.activeWorkerMaxDepth = this.analysisDepth;
+    this.activeWorkerMaxTimeMs = this.analysisTimeMs;
+    this.lastAnalysisStopReason = null;
+    this.lastAnalysisCanResume = false;
+    this.clearAnalysisDeadlineTimer();
     this.analysisBusy = true;
-    this.lastAnalysis = null;
-    this.lastAnalysisMs = 0;
+    if (!samePositionRestart) {
+      this.lastAnalysis = null;
+      this.lastAnalysisMs = 0;
+    }
     this.board.setArrows(this.computeBoardArrows());
     this.renderAnalysisPanel();
     this.renderEvalBar();
 
     const t0 = performance.now();
+    this.analysisStartPerf = t0 - baseElapsedMs;
     try {
       const res = await this.engine.analyze(fen, {
         maxDepth: this.analysisDepth,
         maxNodes: this.analysisTimeMs === 0 ? 0 : undefined,
-        maxTimeMs: this.analysisTimeMs > 0 ? this.analysisTimeMs : undefined,
+        maxTimeMs: requestedMaxTimeMs,
         threads: this.analysisThreads,
         multipv: this.analysisMultiPv,
         historyHashes: hashes,
         legalMoves: this.currentSnapshot.legal_moves.map((m) => m.long_notation),
+        resume: canResume,
         onProgress: (update) => {
           if (seq !== this.analysisSeq) return;
+          const elapsed = baseElapsedMs + Math.max(1, Math.round(performance.now() - t0));
+          const hasLines = update.lines.length > 0;
           this.lastAnalysis = {
             depth: update.depth,
             nodes: update.nodes,
-            lines: update.lines,
+            lines: hasLines ? update.lines : (this.lastAnalysis?.lines ?? []),
           };
-          this.lastAnalysisMs = Math.max(1, Math.round(performance.now() - t0));
+          this.lastAnalysisMs = elapsed;
+          if (this.lastAnalysis.lines.length > 0) {
+            const depthReducedBelowWorker =
+              this.committedAnalysisDepth > 0 &&
+              this.committedAnalysisDepth < this.activeWorkerMaxDepth &&
+              update.depth >= this.committedAnalysisDepth;
+            if (depthReducedBelowWorker) {
+              this.stopRunningAnalysisKeepResult("depth");
+              return;
+            }
+            const timeReducedBelowWorker =
+              this.committedAnalysisTimeMs > 0 &&
+              (this.activeWorkerMaxTimeMs === 0 ||
+                this.committedAnalysisTimeMs < this.activeWorkerMaxTimeMs) &&
+              elapsed >= this.committedAnalysisTimeMs;
+            if (timeReducedBelowWorker) {
+              this.stopRunningAnalysisKeepResult("timeout");
+              return;
+            }
+          }
           this.board.setArrows(this.computeBoardArrows());
           this.renderAnalysisPanel();
           this.renderEvalBar();
         },
       });
       if (seq !== this.analysisSeq) return;
+      this.clearAnalysisDeadlineTimer();
       this.lastAnalysis = res;
-      this.lastAnalysisMs = Math.max(1, Math.round(performance.now() - t0));
+      this.lastAnalysisMs = baseElapsedMs + Math.max(1, Math.round(performance.now() - t0));
+      this.lastAnalysisRunTimeMs = this.committedAnalysisTimeMs;
+      this.lastAnalysisRunThreads = this.committedAnalysisThreads;
+      this.lastAnalysisCanResume = true;
+      if (res.depth >= this.committedAnalysisDepth) {
+        this.lastAnalysisStopReason = "depth";
+      } else if (
+        this.committedAnalysisTimeMs === 0 ||
+        ((this.currentSnapshot?.legal_moves.length ?? 0) <= 1 && res.depth >= 4)
+      ) {
+        this.lastAnalysisStopReason = "solved";
+      } else {
+        this.lastAnalysisStopReason = "timeout";
+      }
       this.analysisBusy = false;
       this.board.setArrows(this.computeBoardArrows());
       this.renderAnalysisPanel();
       this.renderEvalBar();
+
+      if (this.shouldRecalculateWhenIdle()) {
+        void this.triggerAnalysisIfEnabled(true);
+      }
     } catch (err) {
       if (seq !== this.analysisSeq || err instanceof AnalysisCancelledError) return;
+      this.clearAnalysisDeadlineTimer();
       this.analysisBusy = false;
       this.renderAnalysisPanel();
     }
@@ -2595,7 +2740,7 @@ class LimakhosApp {
     const t = this.t();
     const maxHw =
       typeof navigator !== "undefined" && navigator.hardwareConcurrency
-        ? Math.max(1, Math.min(16, navigator.hardwareConcurrency))
+        ? Math.max(8, Math.min(16, navigator.hardwareConcurrency))
         : 8;
     if (this.analysisThreads > maxHw) {
       this.analysisThreads = maxHw;
@@ -2626,7 +2771,7 @@ class LimakhosApp {
           </div>
           <div class="engine-slider-row">
             <label for="inp-depth">${escapeHtml(t.maxDepthLabel)}</label>
-            <input id="inp-depth" type="range" class="li-slider" min="1" max="24" step="1" value="${this.analysisDepth}" />
+            <input id="inp-depth" type="range" class="li-slider" min="1" max="${MAX_ANALYSIS_DEPTH}" step="1" value="${this.analysisDepth}" />
             <span class="engine-slider-val" id="val-depth">${this.analysisDepth}</span>
           </div>
           <div class="engine-slider-row">
@@ -2635,7 +2780,21 @@ class LimakhosApp {
             <span class="engine-slider-val" id="val-time-ms">${escapeHtml(formatAnalysisTime(this.analysisTimeMs))}</span>
           </div>
         </div>
-        <div class="pv-list" id="pv-list-slot"></div>
+        <div class="pv-list" id="pv-list-slot">
+          <button type="button" class="pv-row" data-pv-slot="0" hidden>
+            <span class="pv-score"></span>
+            <span class="pv-line"></span>
+          </button>
+          <button type="button" class="pv-row" data-pv-slot="1" hidden>
+            <span class="pv-score"></span>
+            <span class="pv-line"></span>
+          </button>
+          <button type="button" class="pv-row" data-pv-slot="2" hidden>
+            <span class="pv-score"></span>
+            <span class="pv-line"></span>
+          </button>
+          <div class="pv-placeholder" id="pv-placeholder" hidden></div>
+        </div>
       `;
 
       this.analysisPanelEl.querySelector("#btn-toggle-engine")?.addEventListener("click", () => {
@@ -2646,7 +2805,9 @@ class LimakhosApp {
         this.board.setArrows(this.computeBoardArrows());
         this.renderEvalBar();
         this.renderAnalysisPanel();
-        if (this.analysisEnabled) void this.triggerAnalysisIfEnabled();
+        if (this.analysisEnabled && this.shouldRecalculateWhenIdle()) {
+          void this.triggerAnalysisIfEnabled(true);
+        }
       });
 
       const threadsInput = this.analysisPanelEl.querySelector<HTMLInputElement>("#inp-threads");
@@ -2658,23 +2819,49 @@ class LimakhosApp {
       });
       threadsInput?.addEventListener("change", () => {
         const val = Math.max(1, Math.min(maxHw, Math.round(Number(threadsInput.value) || 1)));
+        const prevThreads = this.committedAnalysisThreads;
         this.analysisThreads = val;
+        this.committedAnalysisThreads = val;
         if (threadsVal) threadsVal.textContent = String(val);
-        if (this.analysisEnabled) void this.triggerAnalysisIfEnabled();
+        if (this.analysisEnabled && this.analysisBusy && val !== prevThreads) {
+          void this.triggerAnalysisIfEnabled();
+        }
       });
 
       const depthInput = this.analysisPanelEl.querySelector<HTMLInputElement>("#inp-depth");
       const depthVal = this.analysisPanelEl.querySelector<HTMLElement>("#val-depth");
       depthInput?.addEventListener("input", () => {
-        const val = Math.max(1, Math.min(24, Math.round(Number(depthInput.value) || 1)));
+        const val = Math.max(
+          1,
+          Math.min(MAX_ANALYSIS_DEPTH, Math.round(Number(depthInput.value) || 1)),
+        );
         this.analysisDepth = val;
         if (depthVal) depthVal.textContent = String(val);
       });
       depthInput?.addEventListener("change", () => {
-        const val = Math.max(1, Math.min(24, Math.round(Number(depthInput.value) || 1)));
+        const val = Math.max(
+          1,
+          Math.min(MAX_ANALYSIS_DEPTH, Math.round(Number(depthInput.value) || 1)),
+        );
         this.analysisDepth = val;
+        this.committedAnalysisDepth = val;
         if (depthVal) depthVal.textContent = String(val);
-        if (this.analysisEnabled) void this.triggerAnalysisIfEnabled();
+        if (!this.analysisEnabled) return;
+
+        if (this.analysisBusy) {
+          if (val > this.activeWorkerMaxDepth) {
+            // Let the running worker batch finish with TT intact, then resume deeper.
+            this.renderAnalysisPanel();
+          } else if (this.lastAnalysis && this.lastAnalysis.depth >= val) {
+            this.stopRunningAnalysisKeepResult("depth");
+          } else {
+            this.renderAnalysisPanel();
+          }
+        } else if (this.shouldRecalculateWhenIdle()) {
+          void this.triggerAnalysisIfEnabled(true);
+        } else {
+          this.renderAnalysisPanel();
+        }
       });
 
       const timeInput = this.analysisPanelEl.querySelector<HTMLInputElement>("#inp-time-ms");
@@ -2691,9 +2878,45 @@ class LimakhosApp {
         if (timeVal) timeVal.textContent = formatAnalysisTime(this.analysisTimeMs);
       });
       timeInput?.addEventListener("change", () => {
-        this.analysisTimeMs = readSliderTime();
+        const nextTimeMs = readSliderTime();
+        this.analysisTimeMs = nextTimeMs;
+        this.committedAnalysisTimeMs = nextTimeMs;
         if (timeVal) timeVal.textContent = formatAnalysisTime(this.analysisTimeMs);
-        if (this.analysisEnabled) void this.triggerAnalysisIfEnabled();
+        if (!this.analysisEnabled) return;
+
+        if (this.analysisBusy) {
+          if (
+            effectiveAnalysisTimeMs(nextTimeMs) >
+            effectiveAnalysisTimeMs(this.activeWorkerMaxTimeMs)
+          ) {
+            // Let the running worker batch finish with TT intact, then resume with extra time.
+            this.clearAnalysisDeadlineTimer();
+          } else if (nextTimeMs === 0) {
+            this.clearAnalysisDeadlineTimer();
+          } else {
+            const elapsed = performance.now() - this.analysisStartPerf;
+            if (elapsed >= nextTimeMs) {
+              if (this.lastAnalysis && this.lastAnalysis.lines.length > 0) {
+                this.stopRunningAnalysisKeepResult("timeout");
+              } else {
+                this.scheduleAnalysisDeadline(10);
+              }
+            } else {
+              this.scheduleAnalysisDeadline(nextTimeMs - elapsed);
+            }
+          }
+        } else if (this.shouldRecalculateWhenIdle()) {
+          void this.triggerAnalysisIfEnabled(true);
+        }
+      });
+
+      this.analysisPanelEl.querySelectorAll<HTMLButtonElement>("[data-pv-slot]").forEach((btn) => {
+        btn.addEventListener("click", () => {
+          const tok = btn.dataset.pvMove;
+          if (tok && this.canHumanMoveNow()) {
+            void this.commitNotation(tok);
+          }
+        });
       });
     }
 
@@ -2713,10 +2936,10 @@ class LimakhosApp {
       ? t.engineOff
       : this.analysisBusy
         ? res && res.depth > 0
-          ? `d${res.depth}/${this.analysisDepth} • ${this.analysisThreads}T • ${t.engineThinking}`
+          ? `d${res.depth}/${this.analysisDepth} • ${this.committedAnalysisThreads}T • ${t.engineThinking}`
           : t.engineThinking
         : res
-          ? `d${res.depth}/${this.analysisDepth} • ${this.analysisThreads}T`
+          ? `d${res.depth}/${this.analysisDepth} • ${this.committedAnalysisThreads}T`
           : t.engineAnalysis;
 
     const headLeftEl = this.analysisPanelEl.querySelector<HTMLElement>("#engine-head-left");
@@ -2763,40 +2986,55 @@ class LimakhosApp {
     if (pvListEl) {
       pvListEl.hidden = !this.analysisEnabled;
       if (this.analysisEnabled) {
+        const rows = pvListEl.querySelectorAll<HTMLButtonElement>("[data-pv-slot]");
+        const placeholderEl = pvListEl.querySelector<HTMLElement>("#pv-placeholder");
         if (res && snap && res.lines.length > 0) {
+          if (placeholderEl) placeholderEl.hidden = true;
           const lines = res.lines.slice(0, 3);
-          const rowsHtml = lines
-            .map((line) => {
+          rows.forEach((btn, idx) => {
+            const line = lines[idx];
+            const scoreEl = btn.querySelector<HTMLElement>(".pv-score");
+            const lineEl = btn.querySelector<HTMLElement>(".pv-line");
+            btn.hidden = false;
+            if (line) {
               const badge = formatEvalLight(line.score_light_cp, line.mate_in, snap.side_to_move);
               const scoreCls = line.score_light_cp >= 0 ? "is-light" : "is-dark";
               const bestToken = line.pv_notations[0] ?? "";
-              return `
-                <button type="button" class="pv-row" data-pv-move="${escapeHtml(bestToken)}">
-                  <span class="pv-score ${scoreCls}">${badge}</span>
-                  <span class="pv-line">${escapeHtml(line.pv_notations.join("  "))}</span>
-                </button>
-              `;
-            })
-            .join("");
-          const emptyCount = Math.max(0, 3 - lines.length);
-          const fillersHtml = `<div class="pv-row is-empty" aria-hidden="true"></div>`.repeat(emptyCount);
-          pvListEl.innerHTML = `${rowsHtml}${fillersHtml}`;
-        } else {
-          pvListEl.innerHTML = `<div class="pv-placeholder">${escapeHtml(
-            this.analysisBusy ? t.engineThinking : "—",
-          )}</div>`;
-        }
-
-        pvListEl.querySelectorAll<HTMLButtonElement>("[data-pv-move]").forEach((btn) => {
-          btn.addEventListener("click", () => {
-            const tok = btn.dataset.pvMove;
-            if (tok && this.canHumanMoveNow()) {
-              void this.commitNotation(tok);
+              btn.classList.remove("is-empty");
+              btn.removeAttribute("aria-hidden");
+              btn.disabled = false;
+              btn.dataset.pvMove = bestToken;
+              if (scoreEl) {
+                scoreEl.className = `pv-score ${scoreCls}`;
+                scoreEl.textContent = badge;
+              }
+              if (lineEl) {
+                lineEl.textContent = line.pv_notations.join("  ");
+              }
+            } else {
+              btn.classList.add("is-empty");
+              btn.setAttribute("aria-hidden", "true");
+              btn.disabled = true;
+              delete btn.dataset.pvMove;
+              if (scoreEl) {
+                scoreEl.className = "pv-score";
+                scoreEl.textContent = "";
+              }
+              if (lineEl) {
+                lineEl.textContent = "";
+              }
             }
           });
-        });
-      } else {
-        pvListEl.innerHTML = "";
+        } else {
+          rows.forEach((btn) => {
+            btn.hidden = true;
+            delete btn.dataset.pvMove;
+          });
+          if (placeholderEl) {
+            placeholderEl.hidden = false;
+            placeholderEl.textContent = this.analysisBusy ? t.engineThinking : "—";
+          }
+        }
       }
     }
   }

@@ -1006,12 +1006,18 @@ button {
   transition: background-color 100ms ease;
 }
 
+.pv-row[hidden],
+.pv-placeholder[hidden] {
+  display: none;
+}
+
 .pv-row:hover:not(.is-empty) {
   background: var(--bg-hover);
 }
 
 .pv-row.is-empty {
   pointer-events: none;
+  cursor: default;
 }
 
 .pv-placeholder {

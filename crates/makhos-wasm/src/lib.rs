@@ -26,6 +26,18 @@ thread_local! {
 extern "C" {
     fn host_now_ms() -> f64;
     fn host_on_progress(ptr: *const u8, len: usize);
+    fn host_should_abort() -> i32;
+}
+
+fn should_abort_search() -> bool {
+    #[cfg(target_arch = "wasm32")]
+    {
+        unsafe { host_should_abort() != 0 }
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        false
+    }
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -102,6 +114,8 @@ pub enum WasmRequest {
         history_hashes: Vec<String>,
         #[serde(default)]
         root_moves: Option<Vec<String>>,
+        #[serde(default)]
+        resume: bool,
     },
     AiMove {
         fen: String,
@@ -350,6 +364,7 @@ fn dispatch(req: WasmRequest) -> WasmResponse {
             multipv,
             history_hashes,
             root_moves,
+            resume,
         } => {
             let hashes = parse_hashes(&history_hashes);
             let pos = match from_fen(&fen) {
@@ -374,19 +389,22 @@ fn dispatch(req: WasmRequest) -> WasmResponse {
                 multipv,
                 history_hashes: hashes,
                 root_moves,
+                resume,
             };
             let clock = current_time_ms;
+            let abort_check = should_abort_search;
             let mut progress_cb = |progress: SearchProgress<'_>| {
                 emit_progress(progress);
             };
             let result = ENGINE.with(|eng| {
                 LAZY_TB.with(|tb| {
-                    eng.borrow_mut().analyze_with_progress(
+                    eng.borrow_mut().analyze_with_controls(
                         &pos,
                         &cfg,
                         Some(tb as &dyn TablebaseProbe),
                         Some(&clock),
                         Some(&mut progress_cb),
+                        Some(&abort_check),
                     )
                 })
             });

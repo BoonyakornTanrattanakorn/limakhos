@@ -18,6 +18,9 @@ interface PendingCall {
 interface WorkerSlot {
   worker: Worker;
   pending: Map<number, PendingCall>;
+  abortView: Int32Array | null;
+  softAborting: boolean;
+  drainResolvers: Array<() => void>;
 }
 
 interface WorkerOutbound {
@@ -47,6 +50,7 @@ export interface AnalyzeOptions {
   multipv?: number;
   historyHashes?: string[];
   legalMoves?: string[];
+  resume?: boolean;
   onProgress?: (update: AnalysisProgressUpdate) => void;
 }
 
@@ -89,14 +93,48 @@ export class MakhosEngineClient {
     })();
   }
 
-  private createSlot(): WorkerSlot {
+  private canUseSharedAbort(): boolean {
+    return (
+      typeof SharedArrayBuffer !== "undefined" &&
+      typeof Atomics !== "undefined" &&
+      typeof globalThis !== "undefined" &&
+      (globalThis as { crossOriginIsolated?: boolean }).crossOriginIsolated === true
+    );
+  }
+
+  private flushDrain(slot: WorkerSlot): void {
+    if (slot.pending.size > 0) return;
+    slot.softAborting = false;
+    if (slot.drainResolvers.length > 0) {
+      const resolvers = slot.drainResolvers.splice(0);
+      for (const resolve of resolvers) resolve();
+    }
+  }
+
+  private createSlot(withAbortBuffer = false): WorkerSlot {
     const worker = new Worker(new URL("./worker.ts", import.meta.url), { type: "module" });
     const pending = new Map<number, PendingCall>();
-    const slot: WorkerSlot = { worker, pending };
+    let abortBuffer: SharedArrayBuffer | undefined;
+    let abortView: Int32Array | null = null;
+    if (withAbortBuffer && this.canUseSharedAbort()) {
+      abortBuffer = new SharedArrayBuffer(4);
+      abortView = new Int32Array(abortBuffer);
+    }
+    const slot: WorkerSlot = {
+      worker,
+      pending,
+      abortView,
+      softAborting: false,
+      drainResolvers: [],
+    };
 
-    if (this.compiledModule) {
+    if (this.compiledModule || abortBuffer) {
       try {
-        worker.postMessage({ type: "init", module: this.compiledModule });
+        worker.postMessage({
+          type: "init",
+          module: this.compiledModule ?? undefined,
+          abortBuffer,
+        });
       } catch {
         // Fallback to worker fetch
       }
@@ -112,6 +150,7 @@ export class MakhosEngineClient {
       }
       if (!resp) return;
       pending.delete(id);
+      this.flushDrain(slot);
       if (resp.ok === "error") {
         entry.reject(new Error(resp.message));
       } else {
@@ -125,6 +164,7 @@ export class MakhosEngineClient {
         p.reject(err);
       }
       pending.clear();
+      this.flushDrain(slot);
     };
 
     return slot;
@@ -132,16 +172,47 @@ export class MakhosEngineClient {
 
   private ensureRulesSlot(): WorkerSlot {
     if (!this.rulesSlot) {
-      this.rulesSlot = this.createSlot();
+      this.rulesSlot = this.createSlot(false);
     }
     return this.rulesSlot;
   }
 
   private ensureAnalysisSlots(count: number): WorkerSlot[] {
     while (this.analysisSlots.length < count) {
-      this.analysisSlots.push(this.createSlot());
+      this.analysisSlots.push(this.createSlot(true));
     }
     return this.analysisSlots.slice(0, count);
+  }
+
+  private async waitForSlotIdle(slot: WorkerSlot): Promise<WorkerSlot> {
+    if (slot.pending.size === 0) return slot;
+    await new Promise<void>((resolve) => {
+      let done = false;
+      const finish = () => {
+        if (done) return;
+        done = true;
+        clearTimeout(timer);
+        resolve();
+      };
+      const timer = setTimeout(finish, 150);
+      slot.drainResolvers.push(finish);
+    });
+    if (slot.pending.size === 0) return slot;
+
+    // Fallback: worker did not drain in time, replace it.
+    slot.worker.terminate();
+    const err = new AnalysisCancelledError();
+    for (const [, p] of slot.pending) {
+      p.reject(err);
+    }
+    slot.pending.clear();
+    this.flushDrain(slot);
+    const fresh = this.createSlot(true);
+    const idx = this.analysisSlots.indexOf(slot);
+    if (idx !== -1) {
+      this.analysisSlots[idx] = fresh;
+    }
+    return fresh;
   }
 
   private callOnSlot(
@@ -150,6 +221,9 @@ export class MakhosEngineClient {
     onProgress?: (progress: AnalysisProgress) => void,
   ): Promise<WasmResponse> {
     const id = this.nextId++;
+    if (slot.abortView) {
+      Atomics.store(slot.abortView, 0, 0);
+    }
     return new Promise((resolve, reject) => {
       slot.pending.set(id, { resolve, reject, onProgress });
       slot.worker.postMessage({ id, req });
@@ -157,25 +231,45 @@ export class MakhosEngineClient {
   }
 
   /**
-   * Immediately preempt any in-flight analysis workers without touching the
-   * interactive rules worker or idle analysis workers.
+   * Cooperatively abort any running analysis workers so they exit cleanly
+   * while preserving their transposition tables and `last_search` state.
+   * Falls back to terminating busy workers when SharedArrayBuffer is unavailable.
+   * Returns true if all running workers were stopped without termination.
    */
-  cancelAnalysis(): void {
+  stopAnalysisSoft(): boolean {
     this.activeAnalysisRunId += 1;
+    let preservedAll = true;
     const survivors: WorkerSlot[] = [];
     for (const slot of this.analysisSlots) {
       if (slot.pending.size > 0) {
-        slot.worker.terminate();
-        const err = new AnalysisCancelledError();
-        for (const [, p] of slot.pending) {
-          p.reject(err);
+        if (slot.abortView) {
+          slot.softAborting = true;
+          Atomics.store(slot.abortView, 0, 1);
+          survivors.push(slot);
+        } else {
+          preservedAll = false;
+          slot.worker.terminate();
+          const err = new AnalysisCancelledError();
+          for (const [, p] of slot.pending) {
+            p.reject(err);
+          }
+          slot.pending.clear();
+          this.flushDrain(slot);
         }
-        slot.pending.clear();
       } else {
         survivors.push(slot);
       }
     }
     this.analysisSlots = survivors;
+    return preservedAll;
+  }
+
+  /**
+   * Immediately preempt any in-flight analysis workers without touching the
+   * interactive rules worker or idle analysis workers.
+   */
+  cancelAnalysis(): void {
+    this.stopAnalysisSoft();
   }
 
   async inspect(fen?: string, historyHashes?: string[]): Promise<PositionSnapshot> {
@@ -207,7 +301,7 @@ export class MakhosEngineClient {
     this.cancelAnalysis();
     const runId = this.activeAnalysisRunId;
 
-    const maxDepth = Math.max(1, Math.min(30, Math.round(opts.maxDepth ?? 8)));
+    const maxDepth = Math.max(1, Math.min(48, Math.round(opts.maxDepth ?? 8)));
     const maxTimeMs =
       opts.maxTimeMs !== undefined && opts.maxTimeMs > 0 ? Math.round(opts.maxTimeMs) : undefined;
     const maxNodes = opts.maxNodes;
@@ -224,7 +318,11 @@ export class MakhosEngineClient {
     }
 
     if (threads <= 1 || !moveNotations || moveNotations.length <= 1) {
-      const [slot] = this.ensureAnalysisSlots(1);
+      const [rawSlot] = this.ensureAnalysisSlots(1);
+      const slot = await this.waitForSlotIdle(rawSlot);
+      if (runId !== this.activeAnalysisRunId) {
+        throw new AnalysisCancelledError();
+      }
       let latestLines: AnalysisLine[] = [];
       let lastEmit = 0;
 
@@ -238,6 +336,7 @@ export class MakhosEngineClient {
           max_time_ms: maxTimeMs,
           multipv,
           history_hashes: opts.historyHashes,
+          resume: opts.resume ?? false,
         },
         (p) => {
           if (runId !== this.activeAnalysisRunId) return;
@@ -273,17 +372,24 @@ export class MakhosEngineClient {
         ? Math.max(1, Math.ceil(maxNodes / workerCount))
         : maxNodes;
 
-    const slots = this.ensureAnalysisSlots(workerCount);
+    const rawSlots = this.ensureAnalysisSlots(workerCount);
+    const slots = await Promise.all(rawSlots.map((s) => this.waitForSlotIdle(s)));
+    if (runId !== this.activeAnalysisRunId) {
+      throw new AnalysisCancelledError();
+    }
+    const resume = opts.resume ?? false;
     const states = Array.from({ length: workerCount }, () => ({
       depth: 0,
       nodes: 0,
       lines: [] as AnalysisLine[],
       foundMate: false,
+      initialized: !resume,
     }));
 
     let lastEmit = 0;
     const emitMerged = (force: boolean) => {
       if (runId !== this.activeAnalysisRunId || !opts.onProgress) return;
+      if (states.some((s) => !s.initialized)) return;
       const now = performance.now();
       if (!force && now - lastEmit < 55) return;
       lastEmit = now;
@@ -331,6 +437,7 @@ export class MakhosEngineClient {
             multipv: Math.min(multipv, rootMoves.length),
             history_hashes: opts.historyHashes,
             root_moves: rootMoves,
+            resume,
           },
           (p) => {
             if (runId !== this.activeAnalysisRunId) return;
@@ -340,6 +447,7 @@ export class MakhosEngineClient {
               states[idx].lines = p.lines;
               states[idx].foundMate =
                 p.lines.length > 0 && p.lines[0].mate_in !== null;
+              states[idx].initialized = true;
             }
             emitMerged(false);
           },
@@ -350,6 +458,7 @@ export class MakhosEngineClient {
         states[idx].lines = resp.lines;
         states[idx].foundMate =
           resp.lines.length > 0 && resp.lines[0].mate_in !== null;
+        states[idx].initialized = true;
         emitMerged(true);
         return resp;
       }),
@@ -442,7 +551,10 @@ export class MakhosEngineClient {
 
   async clearCache(): Promise<void> {
     this.cancelAnalysis();
-    const targets: WorkerSlot[] = [...this.analysisSlots];
+    const analysisTargets = await Promise.all(
+      this.analysisSlots.map((slot) => this.waitForSlotIdle(slot)),
+    );
+    const targets: WorkerSlot[] = [...analysisTargets];
     if (this.rulesSlot) targets.push(this.rulesSlot);
     await Promise.all(
       targets.map((slot) => this.callOnSlot(slot, { cmd: "clear_cache" }).catch(() => {})),

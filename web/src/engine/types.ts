@@ -78,6 +78,7 @@ export type WasmRequest =
       multipv?: number;
       history_hashes?: string[];
       root_moves?: string[];
+      resume?: boolean;
     }
   | { cmd: "ai_move"; fen: string; level: number; seed?: number; history_hashes?: string[] }
   | {
